@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+topological_pipeline.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Pipeline: (K_o, h, ε₂, ε₃) → Chern number → topological phase classifier.
+
+Modules
+-------
+1. Hamiltonian Engine   — 6×6 Bloch matrix, multipolar spin liquid / honeycomb
+2. FHS Chern Integrator — Fukui-Hatsugai-Suzuki (2005), fully vectorized with gap checking
+3. Monte Carlo Gen.     — Uniform parameter sampling → labeled CSV
+4. MLP Classifier       — PyTorch 4-layer dense network, multiclass with Early Stopping
+
+Dependencies: numpy, pandas, torch, scikit-learn, tqdm
+"""
+
+from __future__ import annotations
+
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+
+warnings.filterwarnings("ignore")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 1 — BULK HAMILTONIAN ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+_r3i = 1.0 / np.sqrt(3.0)
+NN: np.ndarray = np.array(
+    [[0.0, _r3i], [0.5, -0.5 * _r3i], [-0.5, -0.5 * _r3i]], dtype=np.float64
+)
+
+_r2 = np.sqrt(2.0)
+Jx: np.ndarray = (np.array([[0, _r2, 0], [_r2, 0, _r2], [0, _r2, 0]], dtype=complex) * 0.5)
+Jy: np.ndarray = (np.array([[0, -1j * _r2, 0], [1j * _r2, 0, -1j * _r2], [0, 1j * _r2, 0]], dtype=complex) * 0.5)
+Jz: np.ndarray = np.diag([1.0, 0.0, -1.0]).astype(complex)
+I3: np.ndarray = np.eye(3, dtype=complex)
+
+O20: np.ndarray = 3.0 * (Jz @ Jz) - 2.0 * I3
+O22c: np.ndarray = Jx @ Jx - Jy @ Jy
+O22s: np.ndarray = Jx @ Jy + Jy @ Jx
+
+def _hamiltonian_batch(
+    kx_g: np.ndarray,
+    ky_g: np.ndarray,
+    Ko: float,
+    h: float,
+    eps2: float,
+    eps3: float,
+    alpha: float = 0.5,
+) -> np.ndarray:
+    """Vectorized H(k) for a 2D grid of k-points."""
+    phi = kx_g[:, :, None] * NN[:, 0] + ky_g[:, :, None] * NN[:, 1]
+    f_k = np.exp(1j * phi).sum(axis=-1)
+    
+    H_cf = Ko * O20 + h * Jz + eps2 * O22c + eps3 * O22s
+    # Uso do parâmetro alpha para induzir saltos topológicos maiores
+    T    = I3 + alpha * Ko * (Jx + Jy)
+
+    H_AB = f_k[:, :, None, None] * T[None, None]
+
+    H = np.zeros((*kx_g.shape, 6, 6), dtype=complex)
+    H[:, :, :3, :3] =  H_cf
+    H[:, :, 3:, 3:] = -H_cf
+    H[:, :, :3, 3:] =  H_AB
+    H[:, :, 3:, :3] =  H_AB.conj().transpose(0, 1, 3, 2)
+    return H
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 2 — Metodo FHS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def check_gap(eigenvalues: np.ndarray, n_occ: int, tol: float = 1e-6) -> bool:
+    """Verifica se o gap mínimo de energia entre a banda preenchida e a vazia é respeitado."""
+    gap_min = np.min(eigenvalues[..., n_occ] - eigenvalues[..., n_occ - 1])
+    return gap_min > tol
+
+def fhs_chern_number(H_batch: np.ndarray, n_occ: int) -> int | None:
+    """
+    Motor central numérico FHS. Extraído para permitir o uso 
+    tanto no modelo Multipolar quanto no teste de Haldane.
+    """
+    # 1. Diagonalização e checagem de isolamento das bandas
+    eigvals, psi_all = np.linalg.eigh(H_batch)
+    if not check_gap(eigvals, n_occ):
+        return None
+        
+    psi = psi_all[:, :, :, :n_occ]
+
+    def _link(ax: int) -> np.ndarray:
+        psi_fwd = np.roll(psi, -1, axis=ax)
+        M = np.einsum("...ia,...ib->...ab", psi.conj(), psi_fwd)
+        det_M = np.linalg.det(M)
+        # Proteção contra divisão por zero (instabilidade numérica)
+        det_M = np.where(np.abs(det_M) < 1e-12, 1.0 + 0j, det_M)
+        return det_M / np.abs(det_M)
+
+    U1 = _link(ax=0)
+    U2 = _link(ax=1)
+
+    # Cálculo da força de campo com offset imaginário para estabilizar o ângulo próximo a descontinuidades
+    U_plaquette = (
+        U1
+        * np.roll(U2, -1, axis=0)
+        * np.roll(U1, -1, axis=1).conj()
+        * U2.conj()
+    )
+    F_tilde = np.angle(U_plaquette + 1e-10j)
+    
+    return int(np.round(F_tilde.sum() / (2.0 * np.pi)))
+
+def compute_chern(Ko: float, h: float, eps2: float, eps3: float, N: int = 60, n_occ: int = 3) -> int | None:
+    k1d = np.linspace(0.0, 2.0 * np.pi, N, endpoint=False)
+    kx_g, ky_g = np.meshgrid(k1d, k1d, indexing="ij")
+    H_batch = _hamiltonian_batch(kx_g, ky_g, Ko, h, eps2, eps3, alpha=0.5)
+    return fhs_chern_number(H_batch, n_occ)
+
+def test_haldane_model() -> None:
+    """Valida a precisão da integração FHS usando o clássico modelo de Haldane."""
+    print("Executando teste de validação do método FHS (Modelo de Haldane)...")
+    N = 30
+    k1d = np.linspace(0, 2 * np.pi, N, endpoint=False)
+    kx, ky = np.meshgrid(k1d, k1d, indexing="ij")
+    
+    # Vetores para a rede Honeycomb no espaço real
+    delta = np.array([[0.0, 1/np.sqrt(3)], [0.5, -0.5/np.sqrt(3)], [-0.5, -0.5/np.sqrt(3)]])
+    v1, v2, v3 = delta[1]-delta[2], delta[2]-delta[0], delta[0]-delta[1]
+    
+    # Parâmetros topológicos de Haldane
+    M_mass, t1, t2, phi = 0.3, 1.0, 0.1, np.pi/2
+    
+    # Montagem vetorial
+    f_k = sum(np.exp(1j * (kx * d[0] + ky * d[1])) for d in delta)
+    sum_sin = sum(np.sin(kx * v[0] + ky * v[1]) for v in [v1, v2, v3])
+    
+    d_z = M_mass - 2 * t2 * np.sin(phi) * sum_sin
+    
+    H = np.zeros((N, N, 2, 2), dtype=complex)
+    H[:, :, 0, 0] = d_z
+    H[:, :, 1, 1] = -d_z
+    H[:, :, 0, 1] = t1 * f_k
+    H[:, :, 1, 0] = t1 * f_k.conj()
+    
+    chern_val = fhs_chern_number(H, n_occ=1)
+    
+    assert chern_val in [1, -1], f"FALHA! O modelo de Haldane obteve Chern = {chern_val}, mas deveria ser ±1."
+    print(f"Sucesso! Teste de Haldane passou corretamente com número de Chern C = {chern_val}.\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 3 — MONTE CARLO DATASET GENERATOR
+# ══════════════════════════════════════════════════════════════════════════════
+# ADIÇÃO: Importações necessárias para SMOTE e Métricas Robustas
+from imblearn.over_sampling import SMOTE
+from sklearn.metrics import precision_recall_fscore_support
+
+CSV_PATH = Path("topological_dataset.csv")
+
+_BOUNDS: dict[str, tuple[float, float]] = {
+    "Ko":   (0.0, 3.0),
+    "h":    (-5.0, 5.0),
+    "eps2": (0.0, 1.5),
+    "eps3": (0.0, 1.5),
+}
+
+def generate_dataset(n_samples: int = 5000, N_bz: int = 60, n_occ: int = 3, seed: int = 42, out: Path = CSV_PATH) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    valid_rows = []
+    
+    print(f"Gerando dataset com {n_samples} amostras topologicamente válidas (gap protegido)...")
+    pbar = tqdm(total=n_samples, desc="FHS Integrator")
+
+    while len(valid_rows) < n_samples:
+        batch_size = min(500, n_samples - len(valid_rows) + 200)
+        Ko_v   = rng.uniform(*_BOUNDS["Ko"], batch_size)
+        h_v    = rng.uniform(*_BOUNDS["h"], batch_size)
+        eps2_v = rng.uniform(*_BOUNDS["eps2"], batch_size)
+        eps3_v = rng.uniform(*_BOUNDS["eps3"], batch_size)
+
+        for i in range(batch_size):
+            if len(valid_rows) >= n_samples:
+                break
+            
+            c = compute_chern(Ko_v[i], h_v[i], eps2_v[i], eps3_v[i], N=N_bz, n_occ=n_occ)
+            
+            if c is not None:
+                valid_rows.append((Ko_v[i], h_v[i], eps2_v[i], eps3_v[i], c))
+                pbar.update(1)
+
+    pbar.close()
+    
+    df = pd.DataFrame(valid_rows, columns=["Ko", "h", "eps2", "eps3", "chern"])
+    df.to_csv(out, index=False)
+
+    print(f"\nDataset gerado -> {out}")
+    print("Distribuição das Classes Topológicas (Chern):")
+    print(df["chern"].value_counts().sort_index().to_string())
+    return df
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 4 — TOPOLOGICAL PHASE CLASSIFIER (PyTorch MLP)
+# ══════════════════════════════════════════════════════════════════════════════
+
+FEATURES = ["Ko", "h", "eps2", "eps3"]
+
+class ChernDataset(Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray) -> None:
+        self.X = torch.from_numpy(X.astype(np.float32))
+        self.y = torch.from_numpy(y.astype(np.int64))
+    def __len__(self) -> int: return len(self.y)
+    def __getitem__(self, i: int): return self.X[i], self.y[i]
+
+class TopoPhaseMLP(nn.Module):
+    def __init__(self, n_classes: int, p: float = 0.25) -> None:
+        super().__init__()
+        def _block(d_in: int, d_out: int) -> nn.Sequential:
+            return nn.Sequential(nn.Linear(d_in, d_out), nn.GELU(), nn.Dropout(p))
+
+        self.net = nn.Sequential(
+            _block(4,   128),
+            _block(128, 256),
+            _block(256, 128),
+            _block(128,  64),
+            nn.Linear(64, n_classes),
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+def train_classifier(csv_path: Path = CSV_PATH, epochs: int = 150, batch_size: int = 256, lr: float = 1e-3, val_frac: float = 0.2):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\nTreinando modelo no dispositivo: {device}")
+
+    df = pd.read_csv(csv_path)
+    X_raw = df[FEATURES].values.astype(np.float32)
+    y_raw = df["chern"].values
+
+    classes = np.sort(np.unique(y_raw))
+    c2i = {int(c): i for i, c in enumerate(classes)}
+    y = np.array([c2i[int(c)] for c in y_raw], dtype=np.int64)
+    n_classes = len(classes)
+    
+    rng = np.random.default_rng(0)
+    idx = rng.permutation(len(y))
+    n_val = int(len(y) * val_frac)
+    tr_idx, va_idx = idx[n_val:], idx[:n_val]
+
+    X_tr_raw, y_tr_raw = X_raw[tr_idx], y[tr_idx]
+
+    # 1. IMPLEMENTAÇÃO SMOTE (Balanceamento Espacial)
+    print("\nAplicando SMOTE no conjunto de treinamento...")
+    smote = SMOTE(random_state=42)
+    X_tr_smote, y_tr_smote = smote.fit_resample(X_tr_raw, y_tr_raw)
+    
+    # 2. PADRONIZAÇÃO APÓS SMOTE
+    scaler = StandardScaler().fit(X_tr_smote)
+    X_tr = scaler.transform(X_tr_smote)
+    X_va = scaler.transform(X_raw[va_idx])
+
+    tr_loader = DataLoader(ChernDataset(X_tr, y_tr_smote), batch_size=batch_size, shuffle=True)
+    va_loader = DataLoader(ChernDataset(X_va, y[va_idx]), batch_size=512, shuffle=False)
+
+    model = TopoPhaseMLP(n_classes).to(device)
+
+    # 3. FUNÇÃO DE CUSTO SIMÉTRICA (Remoção da redundância de pesos)
+    criterion = nn.CrossEntropyLoss()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    best_val_loss = float('inf')
+    best_state = None
+    patience = 15
+    epochs_no_improve = 0
+    
+    print(f'\n{"Ep":>4}  {"TrLoss":>8}  {"VaLoss":>8}  {"F1(Mac)":>8}  {"Recall":>7}')
+    print("─" * 45)
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        tr_loss = 0.0
+        for Xb, yb in tr_loader:
+            Xb, yb = Xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(Xb), yb)
+            loss.backward()
+            optimizer.step()
+            tr_loss += loss.item() * len(yb)
+        tr_loss /= len(y_tr_smote)
+
+        model.eval()
+        va_loss = 0.0
+        all_preds, all_targets = [], []
+        
+        with torch.no_grad():
+            for Xb, yb in va_loader:
+                Xb, yb = Xb.to(device), yb.to(device)
+                logits = model(Xb)
+                va_loss += criterion(logits, yb).item() * len(yb)
+                
+                preds = logits.argmax(-1)
+                all_preds.extend(preds.cpu().numpy())
+                all_targets.extend(yb.cpu().numpy())
+                
+        va_loss /= len(va_idx)
+        
+        # 4. MÉTRICAS ROBUSTAS
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            all_targets, all_preds, average='macro', zero_division=0
+        )
+
+        scheduler.step()
+
+        if va_loss < best_val_loss:
+            best_val_loss = va_loss
+            epochs_no_improve = 0
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            epochs_no_improve += 1
+
+        if ep % 10 == 0 or ep == 1:
+            print(f"{ep:>4}  {tr_loss:>8.4f}  {va_loss:>8.4f}  {f1:>8.4f}  {recall:>7.4f}")
+
+        if epochs_no_improve >= patience:
+            print(f"Early stopping trigado na época {ep}! (Sem melhora por {patience} épocas)")
+            break
+
+    model.load_state_dict(best_state)
+    print(f"\nMétricas Finais de Validação -> F1-Score: {f1:.4f} | Recall: {recall:.4f} | Precision: {precision:.4f}")
+    return model, scaler, classes
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    
+    # 0. Teste estrito de estabilidade
+    test_haldane_model()
+
+    # 1. Geração de Dataset
+    # Usando N_bz=60 para garantir fidelidade matemática extrema
+    df = generate_dataset(n_samples=5000, N_bz=60, n_occ=3, seed=42)
+
+    # 2. Treinamento da Rede
+    model, scaler, chern_classes = train_classifier(csv_path=CSV_PATH, epochs=150, batch_size=256, lr=1e-3)
+
+    # 3. Salvar artefatos
+    torch.save(
+        {
+            "model_state":   model.state_dict(),
+            "scaler_mean":   scaler.mean_,
+            "scaler_scale":  scaler.scale_,
+            "chern_classes": chern_classes.tolist(),
+        },
+        "topological_mlp.pt",
+    )
+    print("Salvo com sucesso -> topological_mlp.pt")
