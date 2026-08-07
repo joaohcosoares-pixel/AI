@@ -10,7 +10,16 @@ Modules
 1. Hamiltonian Engine   — 6×6 Bloch matrix, multipolar spin liquid / honeycomb
 2. FHS Chern Integrator — Fukui-Hatsugai-Suzuki (2005), fully vectorized with gap checking
 3. Monte Carlo Gen.     — Uniform parameter sampling → labeled CSV
+3b. Balanced Gen.       — Dataset FISICAMENTE balanceado (sem SMOTE sintético)
 4. MLP Classifier       — PyTorch 4-layer dense network, multiclass with Early Stopping
+
+CORREÇÕES APLICADAS (anti-alucinação / anti-viés para Chern=0):
+- Remoção do SMOTE: interpolar (Ko,h,ε2,ε3) entre classes gera pontos em fases
+  físicas erradas → rótulos inválidos que confundem a rede e a empurram ao prior.
+- Class weights no CrossEntropyLoss (inverso da frequência real).
+- Split estratificado (mantém proporção de classes na validação).
+- Seleção do melhor modelo por F1 macro (não apenas val_loss).
+- Inferência com confiança (aviso em regiões de fronteira / sem gap).
 
 Dependencies: numpy, pandas, torch, scikit-learn, tqdm
 """
@@ -24,6 +33,12 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from sklearn.metrics import (
+    precision_recall_fscore_support,
+    classification_report,
+    confusion_matrix,
+)
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -61,7 +76,7 @@ def _hamiltonian_batch(
     """Vectorized H(k) for a 2D grid of k-points."""
     phi = kx_g[:, :, None] * NN[:, 0] + ky_g[:, :, None] * NN[:, 1]
     f_k = np.exp(1j * phi).sum(axis=-1)
-    
+
     H_cf = Ko * O20 + h * Jz + eps2 * O22c + eps3 * O22s
     # Uso do parâmetro alpha para induzir saltos topológicos maiores
     T    = I3 + alpha * Ko * (Jx + Jy)
@@ -87,14 +102,14 @@ def check_gap(eigenvalues: np.ndarray, n_occ: int, tol: float = 1e-6) -> bool:
 
 def fhs_chern_number(H_batch: np.ndarray, n_occ: int) -> int | None:
     """
-    Motor central numérico FHS. Extraído para permitir o uso 
+    Motor central numérico FHS. Extraído para permitir o uso
     tanto no modelo Multipolar quanto no teste de Haldane.
     """
     # 1. Diagonalização e checagem de isolamento das bandas
     eigvals, psi_all = np.linalg.eigh(H_batch)
     if not check_gap(eigvals, n_occ):
         return None
-        
+
     psi = psi_all[:, :, :, :n_occ]
 
     def _link(ax: int) -> np.ndarray:
@@ -116,7 +131,7 @@ def fhs_chern_number(H_batch: np.ndarray, n_occ: int) -> int | None:
         * U2.conj()
     )
     F_tilde = np.angle(U_plaquette + 1e-10j)
-    
+
     return int(np.round(F_tilde.sum() / (2.0 * np.pi)))
 
 def compute_chern(Ko: float, h: float, eps2: float, eps3: float, N: int = 60, n_occ: int = 3) -> int | None:
@@ -131,39 +146,37 @@ def test_haldane_model() -> None:
     N = 30
     k1d = np.linspace(0, 2 * np.pi, N, endpoint=False)
     kx, ky = np.meshgrid(k1d, k1d, indexing="ij")
-    
+
     # Vetores para a rede Honeycomb no espaço real
     delta = np.array([[0.0, 1/np.sqrt(3)], [0.5, -0.5/np.sqrt(3)], [-0.5, -0.5/np.sqrt(3)]])
     v1, v2, v3 = delta[1]-delta[2], delta[2]-delta[0], delta[0]-delta[1]
-    
+
     # Parâmetros topológicos de Haldane
     M_mass, t1, t2, phi = 0.3, 1.0, 0.1, np.pi/2
-    
+
     # Montagem vetorial
     f_k = sum(np.exp(1j * (kx * d[0] + ky * d[1])) for d in delta)
     sum_sin = sum(np.sin(kx * v[0] + ky * v[1]) for v in [v1, v2, v3])
-    
+
     d_z = M_mass - 2 * t2 * np.sin(phi) * sum_sin
-    
+
     H = np.zeros((N, N, 2, 2), dtype=complex)
     H[:, :, 0, 0] = d_z
     H[:, :, 1, 1] = -d_z
     H[:, :, 0, 1] = t1 * f_k
     H[:, :, 1, 0] = t1 * f_k.conj()
-    
+
     chern_val = fhs_chern_number(H, n_occ=1)
-    
+
     assert chern_val in [1, -1], f"FALHA! O modelo de Haldane obteve Chern = {chern_val}, mas deveria ser ±1."
     print(f"Sucesso! Teste de Haldane passou corretamente com número de Chern C = {chern_val}.\n")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MODULE 3 — MONTE CARLO DATASET GENERATOR
 # ══════════════════════════════════════════════════════════════════════════════
-# ADIÇÃO: Importações necessárias para SMOTE e Métricas Robustas
-from imblearn.over_sampling import SMOTE
-from sklearn.metrics import precision_recall_fscore_support
 
 CSV_PATH = Path("topological_dataset.csv")
+BALANCED_CSV_PATH = Path("topological_balanced_dataset.csv")
 
 _BOUNDS: dict[str, tuple[float, float]] = {
     "Ko":   (0.0, 3.0),
@@ -175,7 +188,7 @@ _BOUNDS: dict[str, tuple[float, float]] = {
 def generate_dataset(n_samples: int = 5000, N_bz: int = 60, n_occ: int = 3, seed: int = 42, out: Path = CSV_PATH) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     valid_rows = []
-    
+
     print(f"Gerando dataset com {n_samples} amostras topologicamente válidas (gap protegido)...")
     pbar = tqdm(total=n_samples, desc="FHS Integrator")
 
@@ -189,20 +202,96 @@ def generate_dataset(n_samples: int = 5000, N_bz: int = 60, n_occ: int = 3, seed
         for i in range(batch_size):
             if len(valid_rows) >= n_samples:
                 break
-            
+
             c = compute_chern(Ko_v[i], h_v[i], eps2_v[i], eps3_v[i], N=N_bz, n_occ=n_occ)
-            
+
             if c is not None:
                 valid_rows.append((Ko_v[i], h_v[i], eps2_v[i], eps3_v[i], c))
                 pbar.update(1)
 
     pbar.close()
-    
+
     df = pd.DataFrame(valid_rows, columns=["Ko", "h", "eps2", "eps3", "chern"])
     df.to_csv(out, index=False)
 
     print(f"\nDataset gerado -> {out}")
     print("Distribuição das Classes Topológicas (Chern):")
+    print(df["chern"].value_counts().sort_index().to_string())
+    return df
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 3b — DATASET FISICAMENTE BALANCEADO (substitui SMOTE)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_balanced_dataset(n_per_class: int = 800, N_bz: int = 60, n_occ: int = 3,
+                              seed: int = 42,
+                              out: Path = BALANCED_CSV_PATH,
+                              max_attempts: int = 120000) -> pd.DataFrame:
+    """
+    Gera um dataset FISICAMENTE balanceado (sem SMOTE / oversampling sintético).
+
+    Coleta amostras reais do integrador FHS até que cada classe Chern observada
+    tenha n_per_class exemplares, ou até max_attempts tentativas. Se alguma
+    classe for muito rara, o dataset é rebalanceado pelo tamanho da classe menos
+    populosa (undersampling da maioria com amostras 100% reais do FHS).
+
+    Isso elimina a "alucinação" induzida por pontos sintéticos interpolados no
+    espaço de parâmetros (que caem em fases físicas erradas / sem gap).
+    """
+    rng = np.random.default_rng(seed)
+    pool: dict[int, list] = {}
+    attempts = 0
+    target = n_per_class
+
+    print(f"Coletando amostras FHS reais até {target} por classe (cap {max_attempts} tentativas)...")
+    pbar = tqdm(total=max_attempts, desc="FHS Integrator (balanceado)")
+
+    stop = False
+    while attempts < max_attempts and not stop:
+        batch_size = 200
+        Ko_v   = rng.uniform(*_BOUNDS["Ko"], batch_size)
+        h_v    = rng.uniform(*_BOUNDS["h"], batch_size)
+        eps2_v = rng.uniform(*_BOUNDS["eps2"], batch_size)
+        eps3_v = rng.uniform(*_BOUNDS["eps3"], batch_size)
+
+        for i in range(batch_size):
+            attempts += 1
+            pbar.update(1)
+            c = compute_chern(Ko_v[i], h_v[i], eps2_v[i], eps3_v[i], N=N_bz, n_occ=n_occ)
+            if c is not None:
+                pool.setdefault(int(c), []).append((Ko_v[i], h_v[i], eps2_v[i], eps3_v[i], int(c)))
+                if all(len(v) >= target for v in pool.values()):
+                    stop = True
+                    break
+            if attempts >= max_attempts:
+                stop = True
+                break
+    pbar.close()
+
+    classes = sorted(pool.keys())
+    counts = {c: len(pool[c]) for c in classes}
+
+    print("\nDistribuição do pool coletado:")
+    for c in classes:
+        print(f"  Chern {c:>2}: {counts[c]} amostras reais")
+
+    n_per_class_eff = min(target, min(counts.values()))
+    if n_per_class_eff < target:
+        print(f"[ATENÇÃO] Classe mais rara tem apenas {min(counts.values())} amostras. "
+              f"Balanceando para {n_per_class_eff} por classe.")
+
+    balanced = []
+    for c in classes:
+        rows = pool[c]
+        idx = rng.choice(len(rows), size=n_per_class_eff, replace=False)
+        balanced.extend(rows[j] for j in idx)
+
+    rng.shuffle(balanced)
+    df = pd.DataFrame(balanced, columns=["Ko", "h", "eps2", "eps3", "chern"])
+    df.to_csv(out, index=False)
+
+    print(f"\nDataset BALANCEADO gerado -> {out}  ({len(df)} linhas, {len(classes)} classes)")
+    print("Distribuição Final das Classes:")
     print(df["chern"].value_counts().sort_index().to_string())
     return df
 
@@ -235,7 +324,9 @@ class TopoPhaseMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-def train_classifier(csv_path: Path = CSV_PATH, epochs: int = 150, batch_size: int = 256, lr: float = 1e-3, val_frac: float = 0.2):
+def train_classifier(csv_path: Path = BALANCED_CSV_PATH, epochs: int = 200,
+                     batch_size: int = 256, lr: float = 1e-3, val_frac: float = 0.2,
+                     patience: int = 20, use_class_weights: bool = True):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nTreinando modelo no dispositivo: {device}")
 
@@ -247,40 +338,41 @@ def train_classifier(csv_path: Path = CSV_PATH, epochs: int = 150, batch_size: i
     c2i = {int(c): i for i, c in enumerate(classes)}
     y = np.array([c2i[int(c)] for c in y_raw], dtype=np.int64)
     n_classes = len(classes)
-    
-    rng = np.random.default_rng(0)
-    idx = rng.permutation(len(y))
-    n_val = int(len(y) * val_frac)
-    tr_idx, va_idx = idx[n_val:], idx[:n_val]
+    print(f"Classes Chern encontradas: {classes.tolist()}  |  Total de amostras: {len(y)}")
 
-    X_tr_raw, y_tr_raw = X_raw[tr_idx], y[tr_idx]
+    # ── Split ESTRATIFICADO (preserva a proporção de classes na validação) ──
+    X_tr_raw, X_va_raw, y_tr_raw, y_va = train_test_split(
+        X_raw, y, test_size=val_frac, random_state=0, stratify=y
+    )
 
-    # 1. IMPLEMENTAÇÃO SMOTE (Balanceamento Espacial)
-    print("\nAplicando SMOTE no conjunto de treinamento...")
-    smote = SMOTE(random_state=42)
-    X_tr_smote, y_tr_smote = smote.fit_resample(X_tr_raw, y_tr_raw)
-    
-    # 2. PADRONIZAÇÃO APÓS SMOTE
-    scaler = StandardScaler().fit(X_tr_smote)
-    X_tr = scaler.transform(X_tr_smote)
-    X_va = scaler.transform(X_raw[va_idx])
+    # ── Padronização (fit APENAS no treino) ──
+    scaler = StandardScaler().fit(X_tr_raw)
+    X_tr = scaler.transform(X_tr_raw)
+    X_va = scaler.transform(X_va_raw)
 
-    tr_loader = DataLoader(ChernDataset(X_tr, y_tr_smote), batch_size=batch_size, shuffle=True)
-    va_loader = DataLoader(ChernDataset(X_va, y[va_idx]), batch_size=512, shuffle=False)
+    tr_loader = DataLoader(ChernDataset(X_tr, y_tr_raw), batch_size=batch_size, shuffle=True)
+    va_loader = DataLoader(ChernDataset(X_va, y_va), batch_size=512, shuffle=False)
 
     model = TopoPhaseMLP(n_classes).to(device)
 
-    # 3. FUNÇÃO DE CUSTO SIMÉTRICA (Remoção da redundância de pesos)
-    criterion = nn.CrossEntropyLoss()
+    # ── Class weights (inverso da frequência real → penaliza erro na minoria) ──
+    if use_class_weights:
+        counts = np.bincount(y_tr_raw)
+        class_weights = torch.tensor(
+            (len(y_tr_raw) / (n_classes * counts)).astype(np.float32), device=device
+        )
+        print(f"Class weights: {class_weights.tolist()}")
+    else:
+        class_weights = None
 
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    best_val_loss = float('inf')
-    best_state = None
-    patience = 15
+    # ── Seleção do melhor modelo por F1 macro ──
+    best_f1, best_state = -1.0, None
     epochs_no_improve = 0
-    
+
     print(f'\n{"Ep":>4}  {"TrLoss":>8}  {"VaLoss":>8}  {"F1(Mac)":>8}  {"Recall":>7}')
     print("─" * 45)
 
@@ -294,33 +386,32 @@ def train_classifier(csv_path: Path = CSV_PATH, epochs: int = 150, batch_size: i
             loss.backward()
             optimizer.step()
             tr_loss += loss.item() * len(yb)
-        tr_loss /= len(y_tr_smote)
+        tr_loss /= len(y_tr_raw)
 
         model.eval()
         va_loss = 0.0
         all_preds, all_targets = [], []
-        
+
         with torch.no_grad():
             for Xb, yb in va_loader:
                 Xb, yb = Xb.to(device), yb.to(device)
                 logits = model(Xb)
                 va_loss += criterion(logits, yb).item() * len(yb)
-                
+
                 preds = logits.argmax(-1)
                 all_preds.extend(preds.cpu().numpy())
                 all_targets.extend(yb.cpu().numpy())
-                
-        va_loss /= len(va_idx)
-        
-        # 4. MÉTRICAS ROBUSTAS
+
+        va_loss /= len(y_va)
+
         precision, recall, f1, _ = precision_recall_fscore_support(
             all_targets, all_preds, average='macro', zero_division=0
         )
 
         scheduler.step()
 
-        if va_loss < best_val_loss:
-            best_val_loss = va_loss
+        if f1 > best_f1:
+            best_f1 = f1
             epochs_no_improve = 0
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         else:
@@ -334,23 +425,82 @@ def train_classifier(csv_path: Path = CSV_PATH, epochs: int = 150, batch_size: i
             break
 
     model.load_state_dict(best_state)
-    print(f"\nMétricas Finais de Validação -> F1-Score: {f1:.4f} | Recall: {recall:.4f} | Precision: {precision:.4f}")
+    model.eval()
+
+    # ── Métricas finais por classe (transparência completa) ──
+    print("\n═══ RELATÓRIO FINAL DE VALIDAÇÃO (melhor época por F1 macro) ═══")
+    print(f"F1-Score macro: {best_f1:.4f}")
+
+    final_preds, final_targets = [], []
+    with torch.no_grad():
+        for Xb, yb in va_loader:
+            Xb, yb = Xb.to(device), yb.to(device)
+            logits = model(Xb)
+            final_preds.extend(logits.argmax(-1).cpu().numpy())
+            final_targets.extend(yb.cpu().numpy())
+
+    idx2c = {i: int(c) for i, c in enumerate(classes)}
+    print("\nMétricas POR CLASSE (Chern real):")
+    print(classification_report(
+        final_targets, final_preds,
+        labels=list(range(n_classes)),
+        target_names=[f"Chern={idx2c[i]}" for i in range(n_classes)],
+        zero_division=0,
+    ))
+    print("Matriz de Confusão (linhas=real, colunas=predito):")
+    print(confusion_matrix(final_targets, final_preds, labels=list(range(n_classes))))
+    print("  Legendas:", [f"Chern={idx2c[i]}" for i in range(n_classes)])
+
     return model, scaler, classes
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INFERÊNCIA COM CONFIANÇA (reduz "alucinação" em pontos incertos)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def predict_chern(model, scaler, classes, Ko, h, eps2, eps3, threshold=0.5):
+    """
+    Prediz o número de Chern com probabilidade de confiança.
+
+    Retorna (chern, confiança) onde 'confiança' é a probabilidade softmax da
+    classe prevista. Se confiança < threshold, o ponto está numa região de
+    fronteira/incerta — o modelo avisa em vez de "chutar".
+    """
+    device = next(model.parameters()).device
+    x = np.array([[Ko, h, eps2, eps3]], dtype=np.float32)
+    x_scaled = scaler.transform(x)
+    with torch.no_grad():
+        logits = model(torch.from_numpy(x_scaled).to(device))
+        probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+
+    idx = int(np.argmax(probs))
+    chern = int(classes[idx])
+    confidence = float(probs[idx])
+
+    if confidence < threshold:
+        print(f"[AVISO] Baixa confiança ({confidence:.2%}). "
+              f"Provável região de fronteira topológica / sem gap.")
+        return None, confidence
+    return chern, confidence
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    
+
     # 0. Teste estrito de estabilidade
     test_haldane_model()
 
-    # 1. Geração de Dataset
-    # Usando N_bz=60 para garantir fidelidade matemática extrema
-    df = generate_dataset(n_samples=5000, N_bz=60, n_occ=3, seed=42)
+    # 1. Geração de Dataset FISICAMENTE BALANCEADO (sem SMOTE)
+    #    N_bz=60 para garantir fidelidade matemática extrema
+    generate_balanced_dataset(n_per_class=800, N_bz=60, n_occ=3, seed=42)
 
     # 2. Treinamento da Rede
-    model, scaler, chern_classes = train_classifier(csv_path=CSV_PATH, epochs=150, batch_size=256, lr=1e-3)
+    model, scaler, chern_classes = train_classifier(
+        csv_path=BALANCED_CSV_PATH, epochs=200, batch_size=256, lr=1e-3
+    )
 
     # 3. Salvar artefatos
     torch.save(
@@ -363,3 +513,4 @@ if __name__ == "__main__":
         "topological_mlp.pt",
     )
     print("Salvo com sucesso -> topological_mlp.pt")
+

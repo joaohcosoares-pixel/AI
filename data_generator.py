@@ -7,6 +7,7 @@ Módulos de Física e Geração de Dados:
 1. Hamiltonian Engine
 2. FHS Chern Integrator
 3. Monte Carlo Dataset Generator
+4. Dataset FISICAMENTE Balanceado (sem SMOTE sintético)
 """
 
 import warnings
@@ -61,7 +62,7 @@ def fhs_chern_number(H_batch: np.ndarray, n_occ: int) -> int | None:
     eigvals, psi_all = np.linalg.eigh(H_batch)
     if not check_gap(eigvals, n_occ):
         return None
-        
+
     psi = psi_all[:, :, :, :n_occ]
 
     def _link(ax: int) -> np.ndarray:
@@ -138,6 +139,81 @@ def generate_dataset(n_samples=5000, N_bz=60, n_occ=3, seed=42, out=CSV_PATH):
     print(df["chern"].value_counts().sort_index().to_string())
     return df
 
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 4 — DATASET FISICAMENTE BALANCEADO (substitui SMOTE)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_balanced_dataset(n_per_class=800, N_bz=60, n_occ=3, seed=42,
+                              out=Path("topological_balanced_dataset.csv"),
+                              max_attempts=120000):
+    """
+    Gera um dataset FISICAMENTE balanceado (sem SMOTE / oversampling sintético).
+
+    Coleta amostras reais do integrador FHS até que cada classe Chern observada
+    tenha n_per_class exemplares, ou até max_attempts tentativas. Se alguma
+    classe for muito rara, o dataset é rebalanceado pelo tamanho da classe menos
+    populosa (undersampling da maioria com amostras 100% reais do FHS).
+
+    Isso elimina a "alucinação" induzida por pontos sintéticos interpolados no
+    espaço de parâmetros (que caem em fases físicas erradas / sem gap).
+    """
+    rng = np.random.default_rng(seed)
+    pool: dict[int, list] = {}
+    attempts = 0
+    target = n_per_class
+
+    print(f"Coletando amostras FHS reais até {target} por classe (cap {max_attempts} tentativas)...")
+    pbar = tqdm(total=max_attempts, desc="FHS Integrator (balanceado)")
+
+    stop = False
+    while attempts < max_attempts and not stop:
+        batch_size = 200
+        Ko_v   = rng.uniform(*_BOUNDS["Ko"], batch_size)
+        h_v    = rng.uniform(*_BOUNDS["h"], batch_size)
+        eps2_v = rng.uniform(*_BOUNDS["eps2"], batch_size)
+        eps3_v = rng.uniform(*_BOUNDS["eps3"], batch_size)
+
+        for i in range(batch_size):
+            attempts += 1
+            pbar.update(1)
+            c = compute_chern(Ko_v[i], h_v[i], eps2_v[i], eps3_v[i], N=N_bz, n_occ=n_occ)
+            if c is not None:
+                pool.setdefault(int(c), []).append((Ko_v[i], h_v[i], eps2_v[i], eps3_v[i], int(c)))
+                if all(len(v) >= target for v in pool.values()):
+                    stop = True
+                    break
+            if attempts >= max_attempts:
+                stop = True
+                break
+    pbar.close()
+
+    classes = sorted(pool.keys())
+    counts = {c: len(pool[c]) for c in classes}
+
+    print("\nDistribuição do pool coletado:")
+    for c in classes:
+        print(f"  Chern {c:>2}: {counts[c]} amostras reais")
+
+    n_per_class_eff = min(target, min(counts.values()))
+    if n_per_class_eff < target:
+        print(f"[ATENÇÃO] Classe mais rara tem apenas {min(counts.values())} amostras. "
+              f"Balanceando para {n_per_class_eff} por classe.")
+
+    balanced = []
+    for c in classes:
+        rows = pool[c]
+        idx = rng.choice(len(rows), size=n_per_class_eff, replace=False)
+        balanced.extend(rows[j] for j in idx)
+
+    rng.shuffle(balanced)
+    df = pd.DataFrame(balanced, columns=["Ko", "h", "eps2", "eps3", "chern"])
+    df.to_csv(out, index=False)
+
+    print(f"\nDataset BALANCEADO gerado -> {out}  ({len(df)} linhas, {len(classes)} classes)")
+    print("Distribuição Final das Classes:")
+    print(df["chern"].value_counts().sort_index().to_string())
+    return df
+
 if __name__ == "__main__":
     test_haldane_model()
-    generate_dataset(n_samples=5000, N_bz=60, n_occ=3, seed=42)
+    generate_balanced_dataset(n_per_class=800, N_bz=60, n_occ=3, seed=42)
