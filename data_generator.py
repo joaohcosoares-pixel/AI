@@ -43,18 +43,37 @@ O22s: np.ndarray = Jx @ Jy + Jy @ Jx
 
 def _hamiltonian_batch(kx_g, ky_g, Ko, h, eps2, eps3, alpha=0.5):
     """
-    Constrói o Hamiltoniano do modelo de spin líquido multipolar em um grid 2D do espaço k.
-    
-    FUNDAMENTAÇÃO PARAMÉTRICA (Justificativa Técnica do papel duplo de Ko):
+    Constrói o Hamiltoniano de um MODELO REPRESENTATIVO TOPOLÓGICO (toy model) em um
+    grid 2D do espaço k, sobre uma rede honeycomb com 2 sub-redes x 3 estados orbitais.
+
+    STATUS DE MODELAGEM (não é uma derivação microscópica de um material real):
     -----------------------------------------------------------------------
-    A variável Ko desempenha um papel físico duplo e crucial no modelo:
-    1) Termo Intra-sub-rede: Atua como a intensidade do campo cristalino elétrico 
-       quadrupolar O20 = 3*Jz^2 - 2*I3 no Hamiltoniano local (H_cf), governando a
-       divisão de energia dos dubletos locais de quadrupolo.
-    2) Termo Inter-sub-rede: Atua na modulação do salto topológico entre sub-redes A e B 
-       através do operador T = I3 + alpha * Ko * (Jx + Jy). Esse termo induz o acoplamento 
-       intersub-rede H_AB = f(k)*T, o qual é responsável pelo fechamento do hiato espectral (gap)
-       nas pontas de Dirac e inversão de bandas, viabilizando os saltos de Chern (C_n != 0).
+    Este NÃO é o Hamiltoniano derivado de um composto específico. É um modelo
+    representativo, construído para demonstrar/validar a metodologia computacional
+    (integração FHS + aceleração por MLP) sobre um Hamiltoniano de banda com
+    transições topológicas genuínas e controláveis. Duas escolhas estruturais
+    precisam ser lidas como isso -- escolhas de modelagem, não fatos físicos
+    derivados -- e não como propriedades de um material real sem citação/derivação
+    microscópica adicional:
+
+    1) AMARRAÇÃO SIMÉTRICA DE Ko (papel duplo, por construção):
+       Ko é usado tanto como intensidade do campo cristalino quadrupolar local
+       O20 = 3*Jz^2 - 2*I3 (termo intra-sub-rede, em H_cf) quanto como fator que
+       modula a amplitude de hopping intersub-rede via T = I3 + alpha*Ko*(Jx+Jy)
+       (termo inter-sub-rede, em H_AB). Amarrar os dois ao mesmo parâmetro é uma
+       escolha deliberada para obter transições topológicas controláveis por um
+       único parâmetro varrido em 1D/2D (útil para gerar o dataset e visualizar
+       diagramas de fase) -- não uma consequência derivada de um mecanismo
+       microscópico específico (spin-órbita, superexchange, etc.). Campo cristalino
+       de íon único e integral de hopping são, em geral, parâmetros fisicamente
+       independentes; tratá-los como o mesmo grau de liberdade exige, para
+       publicação como resultado físico (não apenas metodológico), uma derivação
+       microscópica explícita ou citação a um modelo estabelecido que já faça essa
+       amarração.
+    2) SINAL OPOSTO DE H_cf ENTRE SUB-REDES (H_B = -H_cf, ver bloco de construção
+       abaixo): também uma escolha estrutural do toy model (lembra o termo de massa
+       de Dirac do modelo de Haldane, com sinais opostos nas duas sub-redes), não
+       derivada aqui a partir de simetria do grupo espacial de um material específico.
     """
     phi = kx_g[:, :, None] * NN[:, 0] + ky_g[:, :, None] * NN[:, 1]
     f_k = np.exp(1j * phi).sum(axis=-1)
@@ -77,8 +96,15 @@ def _hamiltonian_batch(kx_g, ky_g, Ko, h, eps2, eps3, alpha=0.5):
 # MODULE 2 — MÉTODO FHS RIGOROSO & ORÁCULO DE GAP ADAPTATIVO
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Constante única de tolerância de gap. Alinhada ao limiar Δmin < 1e-6 declarado no
+# texto do manuscrito (Seção 2.3). Antes desta correção, check_gap_adaptive() usava
+# 1e-5 (default do parâmetro `tol`) enquanto fhs_chern_number() tinha um segundo
+# limiar hardcoded, independente, também em 1e-5 -- dois literais que podiam divergir
+# silenciosamente entre si e do texto. Agora ambos referenciam esta única constante.
+GAP_TOL: float = 1e-6
+
 def check_gap_adaptive(Ko: float, h: float, eps2: float, eps3: float, n_occ: int = 3,
-                       N_init: int = 60, N_high: int = 120, tol: float = 1e-5) -> tuple[bool, float]:
+                       N_init: int = 60, N_high: int = 120, tol: float = GAP_TOL) -> tuple[bool, float]:
     """
     Verifica a robustez do hiato espectral (gap) usando resolução adaptativa.
     Pontos com gap suspeito (perto do limite 'tol') são reavaliados em N_high=120.
@@ -107,17 +133,19 @@ def check_gap_adaptive(Ko: float, h: float, eps2: float, eps3: float, n_occ: int
 
     return True, gap_min
 
-def fhs_chern_number(H_batch: np.ndarray, n_occ: int, quant_tol: float = 1e-2) -> int | None:
+def fhs_chern_number(H_batch: np.ndarray, n_occ: int, quant_tol: float = 1e-2,
+                      gap_tol: float = GAP_TOL) -> int | None:
     """
     Calcula o número de Chern via método Fukui-Hatsugai-Suzuki (FHS) com travas rígidas:
     1. Supressão de mascaramento silencioso: registra matrizes singulares |det(M)| < 1e-12.
     2. Validação estrita de inteiro: exige |C_raw - round(C_raw)| < quant_tol.
+    Usa o mesmo GAP_TOL de check_gap_adaptive (ver Módulo 2) -- limiar único, não duplicado.
     """
     eigvals, psi_all = np.linalg.eigh(H_batch)
     
     # Validação preliminar de gap simples na malha fornecida
     gap_min = np.min(eigvals[..., n_occ] - eigenvalues_occ(eigvals, n_occ))
-    if gap_min <= 1e-5:
+    if gap_min <= gap_tol:
         return None
 
     psi = psi_all[:, :, :, :n_occ]
