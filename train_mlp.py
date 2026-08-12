@@ -28,6 +28,7 @@ dados e de simulação aritmética não-empírica):
    de qualquer rebalanceamento -- nunca hardcoded.
 """
 
+import random
 import time
 import warnings
 from pathlib import Path
@@ -53,6 +54,29 @@ warnings.filterwarnings("ignore")
 
 CSV_PATH = Path("topological_dataset.csv")
 FEATURES = ["Ko", "h", "eps2", "eps3"]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PASSO 1.1 — ISOLAMENTO DO MOTOR ALEATÓRIO (reprodutibilidade estrita)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def seed_everything(seed: int) -> None:
+    """Trava TODAS as fontes de estocasticidade do treino (Python, NumPy, PyTorch
+    CPU/CUDA e o autotuner do cuDNN). Deve ser a primeira chamada de train_and_ablate."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id: int) -> None:
+    """worker_init_fn do DataLoader: re-semeia numpy/random em cada worker a partir
+    do gerador do PyTorch, para o caso de num_workers>0 (hoje 0, mas protege o futuro)."""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATASET & REDE NEURAL (MLP TOPOLÓGICA) -- inalterados
@@ -187,7 +211,9 @@ def apply_calibrated_threshold(probs_nt: np.ndarray, threshold: float) -> np.nda
 # TAREFA 1 — TREINO + SELEÇÃO DE ESTRATÉGIA ESTRITA (só validação) + TESTE 1x
 # ══════════════════════════════════════════════════════════════════════════════
 
-def train_and_ablate(csv_path=CSV_PATH, epochs=120, batch_size=256, lr=1e-3, patience=15):
+def train_and_ablate(csv_path=CSV_PATH, epochs=120, batch_size=256, lr=1e-3, patience=15,
+                      seed: int = 42):
+    seed_everything(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Dispositivo de treinamento: {device}")
 
@@ -209,10 +235,10 @@ def train_and_ablate(csv_path=CSV_PATH, epochs=120, batch_size=256, lr=1e-3, pat
 
     # Triplo split -- inalterado (ja era correto: 70/15/15 estratificado)
     X_tr_val, X_te, y_tr_val, y_te = train_test_split(
-        X_raw, y, test_size=0.15, random_state=42, stratify=y
+        X_raw, y, test_size=0.15, random_state=seed, stratify=y
     )
     X_tr, X_va, y_tr, y_va = train_test_split(
-        X_tr_val, y_tr_val, test_size=0.1765, random_state=42, stratify=y_tr_val
+        X_tr_val, y_tr_val, test_size=0.1765, random_state=seed, stratify=y_tr_val
     )
 
     print(f"\nDivisao do dataset:")
@@ -235,7 +261,7 @@ def train_and_ablate(csv_path=CSV_PATH, epochs=120, batch_size=256, lr=1e-3, pat
         print(f"\n{'-' * 60}\n Treinando estrategia: {strategy.upper()}\n{'-' * 60}")
 
         if strategy == "oversampling":
-            ros = RandomOverSampler(random_state=42)
+            ros = RandomOverSampler(random_state=seed)
             X_tr_proc, y_tr_proc = ros.fit_resample(X_tr_s, y_tr)
             criterion = nn.CrossEntropyLoss()
         else:
@@ -245,7 +271,10 @@ def train_and_ablate(csv_path=CSV_PATH, epochs=120, batch_size=256, lr=1e-3, pat
             weights = torch.tensor((len(y_tr) / (n_classes * counts)).astype(np.float32), device=device)
             criterion = nn.CrossEntropyLoss(weight=weights)
 
-        tr_loader = DataLoader(ChernDataset(X_tr_proc, y_tr_proc), batch_size=batch_size, shuffle=True)
+        g = torch.Generator()
+        g.manual_seed(seed)
+        tr_loader = DataLoader(ChernDataset(X_tr_proc, y_tr_proc), batch_size=batch_size,
+                                shuffle=True, generator=g, worker_init_fn=seed_worker)
 
         model = TopoPhaseMLP(n_classes).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -361,6 +390,47 @@ def train_and_ablate(csv_path=CSV_PATH, epochs=120, batch_size=256, lr=1e-3, pat
         "test_f1_macro_argmax": te["f1_macro"],
     }
     return result, candidates
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PASSO 1.3 + 1.4 — HARNESS DE AVALIAÇÃO EM MÚLTIPLAS SEMENTES + AGREGAÇÃO ESTATÍSTICA
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_multiseed_evaluation(n_trials: int = 20, base_seed: int = 0) -> pd.DataFrame:
+    """
+    Repete train_and_ablate() do zero em n_trials sementes independentes
+    (split + init de pesos + shuffle do DataLoader, todos controlados pela
+    MESMA seed por rodada, via seed_everything) e agrega Limiar/Recall/FPR/
+    F1-Macro no teste. Substitui a alegacao de uma unica rodada por uma
+    distribuicao com media, desvio-padrao, minimo e maximo.
+    """
+    resultados = []
+
+    for seed in range(base_seed, base_seed + n_trials):
+        result, _ = train_and_ablate(seed=seed)
+        resultados.append({
+            "seed": seed,
+            "limiar": result["threshold"],
+            "recall": result["test_tpr"],
+            "fpr": result["test_fpr"],
+            "f1_macro": result["test_f1_macro_argmax"],
+        })
+        print(f"[seed={seed}] Limiar={result['threshold']:.4f}  "
+              f"Recall={result['test_tpr']:.4f}  FPR={result['test_fpr']:.4f}")
+
+    df = pd.DataFrame(resultados)
+
+    print(f"\n{'=' * 65}\n RELATORIO AGREGADO — {n_trials} SEMENTES INDEPENDENTES "
+          f"(seeds {base_seed}..{base_seed + n_trials - 1})\n{'=' * 65}")
+    for col in ["limiar", "recall", "fpr", "f1_macro"]:
+        print(f" {col:10s}: mean={df[col].mean():.4f}  std={df[col].std():.4f}  "
+              f"min={df[col].min():.4f}  max={df[col].max():.4f}")
+
+    frac_full_recall = (df["recall"] >= 0.999).mean()
+    print(f"\n Fracao de rodadas com Recall >= 0.999: {frac_full_recall:.4f} "
+          f"({int((df['recall'] >= 0.999).sum())}/{n_trials})")
+
+    return df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -541,14 +611,22 @@ if __name__ == "__main__":
     if not CSV_PATH.exists():
         print(f"ERRO: Dataset {CSV_PATH} nao encontrado. Execute data_generator.py primeiro.")
     else:
-        result, all_candidates = train_and_ablate(epochs=120, batch_size=256, lr=1e-3)
+        # 1. AUDITORIA ESTATÍSTICA (Comprovação de estabilidade exigida pelo Bloco 1)
+        print(f"\n{'=' * 65}\n FASE 1: AUDITORIA ESTOCÁSTICA (ENSEMBLE DE SEMENTES)\n{'=' * 65}")
+        df_stats = run_multiseed_evaluation(n_trials=15, base_seed=0)
 
+        # 2. TREINAMENTO DE PRODUÇÃO (Usando uma semente fixa auditada para extrair o modelo empírico)
+        print(f"\n{'=' * 65}\n FASE 2: TREINAMENTO DO MODELO DE PRODUÇÃO (SEED=42)\n{'=' * 65}")
+        result, all_candidates = train_and_ablate(epochs=120, batch_size=256, lr=1e-3, seed=42)
+
+        # 3. PROJEÇÃO BAYESIANA
         proj_prec = bayesian_precision_projection(
             test_tpr=result["test_tpr"],
             test_fpr=result["test_fpr"],
-            real_prevalence=result["real_prevalence"],  # Tarefa 4: pi dinamico
+            real_prevalence=result["real_prevalence"],
         )
 
+        # 4. SIMULAÇÃO EMPÍRICA DO PIPELINE HÍBRIDO (Em 10^5 pontos reais)
         hybrid_report = empirical_hybrid_pipeline(
             model=result["model"],
             scaler=result["scaler"],
@@ -558,6 +636,7 @@ if __name__ == "__main__":
             n_eval=100_000,
         )
 
+        # 5. RESUMO EXECUTIVO
         print(f"\n{'=' * 65}\n RESUMO EXECUTIVO\n{'=' * 65}")
         print(f" Estrategia escolhida (por validacao):      {result['strategy']}")
         print(f" Limiar calibrado (Recall=1.0 na validacao): {result['threshold']:.4f}")
