@@ -44,6 +44,8 @@ from sklearn.metrics import (
     precision_recall_curve,
     precision_recall_fscore_support,
 )
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
@@ -388,6 +390,9 @@ def train_and_ablate(csv_path=CSV_PATH, epochs=120, batch_size=256, lr=1e-3, pat
         "test_precision_raw": te_metrics_at_thr["precision"],
         "test_confusion": te_metrics_at_thr,
         "test_f1_macro_argmax": te["f1_macro"],
+        # expõe os splits já computados p/ benchmark_classical_baselines()
+        "X_tr_s": X_tr_s, "y_tr": y_tr, "X_va_s": X_va_s, "y_va": y_va,
+        "X_te_s": X_te_s, "y_te": y_te, "n_classes": n_classes,
     }
     return result, candidates
 
@@ -430,6 +435,51 @@ def run_multiseed_evaluation(n_trials: int = 20, base_seed: int = 0) -> pd.DataF
     print(f"\n Fracao de rodadas com Recall >= 0.999: {frac_full_recall:.4f} "
           f"({int((df['recall'] >= 0.999).sum())}/{n_trials})")
 
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOCO 2 — BENCHMARKING CLÁSSICO (RandomForest balanceada + Regressão Logística)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def benchmark_classical_baselines(X_tr_s, y_tr, X_va_s, y_va, X_te_s, y_te,
+                                   trivial_idx: int, n_classes: int) -> pd.DataFrame:
+    """
+    RandomForest(class_weight='balanced') e LogisticRegression(class_weight=
+    'balanced'), no MESMO split/scaler da MLP, com a MESMA regra de calibração
+    de limiar (maior limiar que garante Recall=1.0 na validação).
+    """
+    bin_va = (y_va != trivial_idx).astype(int)
+    bin_te = (y_te != trivial_idx).astype(int)
+
+    candidates = {
+        "RandomForest": RandomForestClassifier(n_estimators=300, class_weight="balanced",
+                                                 random_state=42, n_jobs=-1),
+        "LogisticRegression": LogisticRegression(max_iter=2000, class_weight="balanced"),
+    }
+
+    rows = []
+    for name, model in candidates.items():
+        t0 = time.perf_counter()
+        model.fit(X_tr_s, y_tr)
+        t_fit = time.perf_counter() - t0
+
+        probs_va = model.predict_proba(X_va_s)
+        thr, _ = calibrate_threshold_for_full_recall(bin_va, 1.0 - probs_va[:, trivial_idx])
+
+        probs_te = model.predict_proba(X_te_s)
+        pred_te = apply_calibrated_threshold(1.0 - probs_te[:, trivial_idx], thr)
+        m = binary_confusion_metrics(bin_te, pred_te)
+        f1 = precision_recall_fscore_support(y_te, model.predict(X_te_s),
+                                              average="macro", zero_division=0)[2]
+
+        rows.append({"modelo": name, "f1_macro": f1, "limiar": thr,
+                     "recall_teste": m["tpr"], "fpr_teste": m["fpr"], "fit_time_s": t_fit})
+
+    df = pd.DataFrame(rows)
+    print(f"\n{'=' * 78}\n BLOCO 2 — BASELINES CLASSICOS (mesmo split/limiar da MLP)\n{'=' * 78}")
+    print(df.to_string(index=False))
+    df.to_csv("classical_baselines.csv", index=False)
     return df
 
 
@@ -615,9 +665,24 @@ if __name__ == "__main__":
         print(f"\n{'=' * 65}\n FASE 1: AUDITORIA ESTOCÁSTICA (ENSEMBLE DE SEMENTES)\n{'=' * 65}")
         df_stats = run_multiseed_evaluation(n_trials=15, base_seed=0)
 
-        # 2. TREINAMENTO DE PRODUÇÃO (Usando uma semente fixa auditada para extrair o modelo empírico)
-        print(f"\n{'=' * 65}\n FASE 2: TREINAMENTO DO MODELO DE PRODUÇÃO (SEED=42)\n{'=' * 65}")
-        result, all_candidates = train_and_ablate(epochs=120, batch_size=256, lr=1e-3, seed=42)
+        # 2. TREINAMENTO DE PRODUÇÃO
+        # ERRO CORRIGIDO: seed=42 (fixo, arbitrário) NÃO pertence a range(0,15)
+        # auditado na FASE 1 -- a estatística do ensemble não certificava a
+        # semente que ia para produção. Produção agora usa a MEDIANA do
+        # próprio ensemble já auditado (por recall, desempate por -fpr).
+        seed_producao = int(
+            df_stats.sort_values(["recall", "fpr"], ascending=[True, True])
+            .iloc[len(df_stats) // 2]["seed"]
+        )
+        print(f"\n{'=' * 65}\n FASE 2: TREINAMENTO DO MODELO DE PRODUÇÃO "
+              f"(SEED={seed_producao}, mediana do ensemble da FASE 1)\n{'=' * 65}")
+        result, all_candidates = train_and_ablate(epochs=120, batch_size=256, lr=1e-3, seed=seed_producao)
+
+        # 2b. BENCHMARK CLÁSSICO -- mesmo split/limiar da MLP escolhida na FASE 2
+        baseline_df = benchmark_classical_baselines(
+            result["X_tr_s"], result["y_tr"], result["X_va_s"], result["y_va"],
+            result["X_te_s"], result["y_te"], result["trivial_idx"], result["n_classes"],
+        )
 
         # 3. PROJEÇÃO BAYESIANA
         proj_prec = bayesian_precision_projection(

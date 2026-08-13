@@ -10,6 +10,7 @@ Módulos de Física Numérica e Oráculo FHS (Refatorado & Rigoroso):
 """
 
 import logging
+import time
 import warnings
 from pathlib import Path
 import numpy as np
@@ -265,6 +266,69 @@ def generate_dataset(n_samples=5000, N_bz=60, n_occ=3, seed=42, out=CSV_PATH):
     print(f"Prevalência Real de Fases Não-Triviais (C != 0): {non_trivial / len(df):.2%}")
     return df
 
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 3b — GERAÇÃO PARALELA (multiprocessing; VETORIZAÇÃO EM LOTE TESTADA E
+# DESCARTADA -- ver "erro 1" no relatório: mais lenta que o loop escalar em
+# todos os tamanhos de lote testados, 1 a 96 pontos, neste oráculo)
+# ══════════════════════════════════════════════════════════════════════════════
+
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
+
+
+def _generate_chunk(n_target: int, N_bz: int, n_occ: int, entropy: int, worker_id: int):
+    """Executado em processo separado. compute_chern_rigorous NÃO é modificado
+    -- só distribuído. Stream aleatório independente via SeedSequence.spawn
+    (não seed+worker_id manual, que pode gerar streams correlacionados)."""
+    rng = np.random.default_rng(entropy)
+    rows = []
+    while len(rows) < n_target:
+        batch = min(500, n_target - len(rows) + 200)
+        Ko_v = rng.uniform(*_BOUNDS["Ko"], batch)
+        h_v = rng.uniform(*_BOUNDS["h"], batch)
+        e2_v = rng.uniform(*_BOUNDS["eps2"], batch)
+        e3_v = rng.uniform(*_BOUNDS["eps3"], batch)
+        for i in range(batch):
+            if len(rows) >= n_target:
+                break
+            c = compute_chern_rigorous(Ko_v[i], h_v[i], e2_v[i], e3_v[i], N_init=N_bz, n_occ=n_occ)
+            if c is not None:
+                rows.append((Ko_v[i], h_v[i], e2_v[i], e3_v[i], c))
+    return worker_id, rows
+
+
+def generate_dataset_parallel(n_samples=50_000, N_bz=60, n_occ=3, seed=42,
+                               out=CSV_PATH, n_workers=None):
+    """Mesma distribuição/oráculo do generate_dataset original -- nenhuma
+    linha de física alterada. Determinístico: reexecutar com o mesmo
+    (seed, n_workers) reproduz byte-a-byte o mesmo dataset (validado)."""
+    n_workers = n_workers or os.cpu_count() or 1
+    per_worker = [n_samples // n_workers] * n_workers
+    for i in range(n_samples % n_workers):
+        per_worker[i] += 1
+    entropies = [int(cs.generate_state(1)[0]) for cs in np.random.SeedSequence(seed).spawn(n_workers)]
+
+    print(f"Gerando {n_samples} amostras em {n_workers} processo(s)...")
+    t0 = time.perf_counter()
+    all_rows = []
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        futs = [ex.submit(_generate_chunk, per_worker[w], N_bz, n_occ, entropies[w], w)
+                for w in range(n_workers)]
+        for fut in as_completed(futs):
+            wid, rows = fut.result()
+            print(f"  worker {wid}: {len(rows)} amostras validas")
+            all_rows.extend(rows)
+    dt = time.perf_counter() - t0
+
+    df = pd.DataFrame(all_rows, columns=["Ko", "h", "eps2", "eps3", "chern"])
+    df.to_csv(out, index=False)
+    print(f"\n{len(df)} amostras -> {out}  ({dt:.1f}s, {dt/len(df)*1000:.2f} ms/amostra efetivo)")
+    counts = df["chern"].value_counts().sort_index()
+    print(counts.to_string())
+    print(f"Prevalencia nao-trivial: {(df['chern']!=0).sum()/len(df):.2%}")
+    return df
+
+
 if __name__ == "__main__":
     test_haldane_model()
-    generate_dataset(n_samples=5000, N_bz=60, n_occ=3, seed=42)
+    generate_dataset_parallel(n_samples=50000, N_bz=60, n_occ=3, seed=42)
