@@ -520,10 +520,48 @@ def bayesian_precision_projection(test_tpr: float, test_fpr: float, real_prevale
 # TAREFA 3 — PIPELINE HÍBRIDO: EXECUÇÃO EMPÍRICA REAL (perf_counter, sem aritmética fixa)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# GUARDA DE DOMÍNIO OOD (bbox exato + Mahalanobis)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TopoDomainGuard:
+    """
+    Softmax NÃO é usado como sinal de OOD (auditoria anterior: confiança
+    satura em ~100% tanto no centro do domínio quanto 3x fora de _BOUNDS).
+    Dois sinais independentes, calculados sobre o RAW (Ko,h,eps2,eps3):
+      1. bbox exato contra `bounds` (ex.: data_generator._BOUNDS).
+      2. Distância de Mahalanobis no espaço padronizado (`scaler`), calibrada
+         no percentil `maha_percentile` da distribuição do próprio treino.
+    """
+    def __init__(self, bounds: dict, scaler, X_train_scaled: np.ndarray, maha_percentile: float = 99.5):
+        self.bounds = bounds
+        self.scaler = scaler
+        self.mu = X_train_scaled.mean(axis=0)
+        cov = np.cov(X_train_scaled, rowvar=False)
+        self.cov_inv = np.linalg.inv(cov + 1e-6 * np.eye(cov.shape[0]))
+        self.maha_threshold = float(np.percentile(self._mahalanobis(X_train_scaled), maha_percentile))
+
+    def _mahalanobis(self, X_scaled: np.ndarray) -> np.ndarray:
+        d = X_scaled - self.mu
+        return np.sqrt(np.einsum("ij,jk,ik->i", d, self.cov_inv, d))
+
+    def check(self, X_raw: np.ndarray, feature_order=("Ko", "h", "eps2", "eps3")) -> dict:
+        in_bbox = np.ones(len(X_raw), dtype=bool)
+        for j, name in enumerate(feature_order):
+            lo, hi = self.bounds[name]
+            in_bbox &= (X_raw[:, j] >= lo) & (X_raw[:, j] <= hi)
+        maha_dist = self._mahalanobis(self.scaler.transform(X_raw))
+        in_density = maha_dist <= self.maha_threshold
+        return {"trusted": in_bbox & in_density, "in_bbox": in_bbox,
+                "in_density": in_density, "maha_dist": maha_dist}
+
+
 def empirical_hybrid_pipeline(model, scaler, classes, trivial_idx: int, threshold: float,
+                               X_train_scaled: np.ndarray,
                                n_eval: int = 100_000,
                                fhs_calibration_sample: int = 40,
                                fhs_full_audit: bool = False,
+                               maha_percentile: float = 99.5,
                                seed: int = 7) -> dict | None:
     """
     Demonstracao EMPIRICA (nao mais aritmetica fixa) do pipeline hibrido:
@@ -577,15 +615,28 @@ def empirical_hybrid_pipeline(model, scaler, classes, trivial_idx: int, threshol
     probs_nt = (1.0 - probs[:, trivial_idx]).cpu().numpy()
     t_mlp_ms_per_point = (t_mlp_total / n_eval) * 1000.0
 
-    # 3. aplica limiar calibrado (Tarefa 2)
-    flagged_mask = probs_nt >= threshold
+    # 3. GATE DE DOMÍNIO -- instanciado com X_tr_s da rede de produção
+    guard = TopoDomainGuard(_BOUNDS, scaler, X_train_scaled=X_train_scaled, maha_percentile=maha_percentile)
+    gate = guard.check(X_new)
+    ood_mask = ~gate["trusted"]
+
+    # 4. limiar calibrado (Tarefa 2) OU fora-de-domínio -- qualquer ponto fora
+    # do domínio confiável (bbox OU Mahalanobis) é interceptado e roteado para
+    # o FHS diretamente, IGNORANDO a predição da MLP nesse ponto (mesmo que
+    # ela diga "trivial").
+    threshold_mask = probs_nt >= threshold
+    flagged_mask = threshold_mask | ood_mask
     flagged_idx = np.where(flagged_mask)[0]
     n_flagged = int(len(flagged_idx))
+    n_ood = int(ood_mask.sum())
+    n_ood_only = int((ood_mask & ~threshold_mask).sum())
 
     print(f" Pontos avaliados pela MLP: {n_eval:,}")
     print(f" Tempo REAL do forward pass (perf_counter): {t_mlp_total * 1000:.2f} ms total "
           f"({t_mlp_ms_per_point:.6f} ms/ponto)")
-    print(f" Sinalizados p/ auditoria FHS (limiar={threshold:.4f}): {n_flagged:,} "
+    print(f" Fora do domínio confiável (bbox ou Mahalanobis p{maha_percentile:g}): {n_ood:,} "
+          f"({n_ood / n_eval:.2%}); destes, {n_ood_only:,} não teriam sido sinalizados pelo limiar sozinho")
+    print(f" Sinalizados p/ auditoria FHS (limiar={threshold:.4f} OU fora-de-domínio): {n_flagged:,} "
           f"({n_flagged / n_eval:.2%} do lote)")
 
     if n_flagged == 0:
@@ -640,6 +691,7 @@ def empirical_hybrid_pipeline(model, scaler, classes, trivial_idx: int, threshol
 
     return {
         "n_eval": n_eval, "n_flagged": n_flagged, "threshold": threshold,
+        "n_ood": n_ood, "n_ood_only": n_ood_only, "ood_fraction": n_ood / n_eval,
         "t_mlp_total_s": t_mlp_total, "t_mlp_ms_per_point": t_mlp_ms_per_point,
         "t_fhs_ms_per_point_measured": t_fhs_ms_per_point_measured,
         "t_fhs_audit_total_s": t_fhs_audit_total_sec,
@@ -663,7 +715,7 @@ if __name__ == "__main__":
     else:
         # 1. AUDITORIA ESTATÍSTICA (Comprovação de estabilidade exigida pelo Bloco 1)
         print(f"\n{'=' * 65}\n FASE 1: AUDITORIA ESTOCÁSTICA (ENSEMBLE DE SEMENTES)\n{'=' * 65}")
-        df_stats = run_multiseed_evaluation(n_trials=15, base_seed=0)
+        df_stats = run_multiseed_evaluation(n_trials=30, base_seed=0)
 
         # 2. TREINAMENTO DE PRODUÇÃO
         # ERRO CORRIGIDO: seed=42 (fixo, arbitrário) NÃO pertence a range(0,15)
@@ -698,6 +750,7 @@ if __name__ == "__main__":
             classes=result["classes"],
             trivial_idx=result["trivial_idx"],
             threshold=result["threshold"],
+            X_train_scaled=result["X_tr_s"],
             n_eval=100_000,
         )
 
