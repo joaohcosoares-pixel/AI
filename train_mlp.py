@@ -13,10 +13,13 @@ dados e de simulação aritmética não-empírica):
    Critério: maximizar Recall da classe não-trivial (Cn != 0) na validação,
    com desempate por menor FPR. O Teste (15%) é tocado exatamente 1 vez, no
    fim do script, já com estratégia e limiar fixados.
-2. Limiar de decisão calibrado via curva Precisão-Recall NA VALIDAÇÃO, para
-   o maior limiar que ainda garante Recall = 1.0 (0 falsos negativos) nesse
-   conjunto. Esse limiar -- não o argmax do softmax -- é o que efetivamente
-   opera o filtro de triagem.
+2. Calibração de Alta Sensibilidade: limiar de decisão ancorado no k-ésimo
+   menor score de P(Cn != 0) entre os positivos da VALIDAÇÃO (k_tolerance=0
+   = score mínimo, comportamento estrito; k_tolerance=k>0 descarta os k
+   positivos mais ruidosos em troca de queda de FPR). Esse limiar -- não o
+   argmax do softmax -- é o que efetivamente opera o filtro de triagem. O
+   Recall pontual no Teste é sempre reportado com IC 95% de Clopper-Pearson
+   (N de positivos é pequeno; ponto isolado sem margem não é honesto).
 3. Pipeline híbrido roda de fato sobre 10^5 pontos novos e reais em R^4:
    forward pass da MLP cronometrado com time.perf_counter(); custo do FHS
    medido também com perf_counter() (não mais uma constante importada do
@@ -48,6 +51,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from statsmodels.stats.proportion import proportion_confint
 from torch.utils.data import DataLoader, Dataset
 
 from data_generator import _BOUNDS, compute_chern_rigorous
@@ -174,35 +178,40 @@ def binary_confusion_metrics(bin_targets: np.ndarray, bin_preds: np.ndarray) -> 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAREFA 2 — CALIBRAÇÃO DE LIMIAR (Precision-Recall na VALIDAÇÃO, Recall=1.0)
+# TAREFA 2 — CALIBRAÇÃO DE ALTA SENSIBILIDADE (k-ésimo menor score, VALIDAÇÃO)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def calibrate_threshold_for_full_recall(bin_targets: np.ndarray, probs_nt: np.ndarray):
+def calibrate_threshold(bin_targets: np.ndarray, probs_nt: np.ndarray, k_tolerance: int = 0):
     """
-    Usa precision_recall_curve (sklearn) sobre P(Cn != 0) na VALIDAÇÃO para achar
-    o MAIOR limiar de probabilidade que ainda garante Recall = 1.0 (0 falsos
-    negativos) nesse conjunto. Retorna (limiar, precisao_no_limiar).
+    Calibração de Alta Sensibilidade: ancora o limiar de decisão no k-ésimo
+    menor score de P(Cn != 0) entre os VERDADEIROS POSITIVOS da validação
+    (indexação 0-based: k_tolerance=0 == score mínimo == comportamento
+    estrito anterior). k_tolerance=k>0 descarta deliberadamente os k
+    positivos mais ruidosos (menor confiança) da validação, trocando recall
+    nominal de validação — que passa a ser (n_pos - k) / n_pos — por queda de
+    FPR. Retorna (limiar, precisao_no_limiar).
 
-    Se nao houver nenhuma amostra positiva na validacao, nao ha o que calibrar:
-    retorna limiar=0.0 (sinaliza tudo) como fallback seguro.
+    Se não houver nenhuma amostra positiva na validação, não há o que
+    calibrar: retorna limiar=0.0 (sinaliza tudo) como fallback seguro.
     """
-    if bin_targets.sum() == 0:
+    if k_tolerance < 0:
+        raise ValueError(f"k_tolerance deve ser >= 0 (recebido: {k_tolerance})")
+
+    n_pos = int(bin_targets.sum())
+    if n_pos == 0:
         return 0.0, 0.0
+    if k_tolerance >= n_pos:
+        raise ValueError(
+            f"k_tolerance={k_tolerance} >= n_pos={n_pos}: positivos insuficientes "
+            f"na validação para descartar essa quantidade sem esvaziar a garantia."
+        )
 
-    precision, recall, thresholds = precision_recall_curve(bin_targets, probs_nt)
-    # precision/recall tem 1 elemento a mais que thresholds (ponto sintetico
-    # threshold=+inf); alinhamos descartando esse ultimo ponto.
-    idx_full_recall = np.where(recall[:-1] >= 1.0 - 1e-9)[0]
-    if len(idx_full_recall) == 0:
-        # nem o limiar mais baixo (0) recupera 100% dos positivos na validacao
-        # -- nao deveria acontecer (threshold=0 sinaliza tudo), mas por
-        # seguranca retornamos o ponto de maior recall disponivel.
-        idx_best = int(np.argmax(recall[:-1])) if len(recall) > 1 else 0
-        thr = float(thresholds[idx_best]) if len(thresholds) > 0 else 0.0
-        return thr, float(precision[idx_best])
+    pos_scores_sorted = np.sort(probs_nt[bin_targets == 1])  # ascendente
+    threshold = float(pos_scores_sorted[k_tolerance])
 
-    idx = idx_full_recall[-1]  # maior limiar que ainda preserva recall=1.0
-    return float(thresholds[idx]), float(precision[idx])
+    bin_preds = apply_calibrated_threshold(probs_nt, threshold)
+    precision_at_thr = binary_confusion_metrics(bin_targets, bin_preds)["precision"]
+    return threshold, precision_at_thr
 
 
 def apply_calibrated_threshold(probs_nt: np.ndarray, threshold: float) -> np.ndarray:
@@ -319,7 +328,7 @@ def train_and_ablate(csv_path=CSV_PATH, epochs=120, batch_size=256, lr=1e-3, pat
         va_final = evaluate_model(model, va_loader, device, trivial_idx, criterion)
 
         # Tarefa 2: limiar calibrado NA VALIDACAO (nunca no teste)
-        threshold, val_prec_at_thr = calibrate_threshold_for_full_recall(
+        threshold, val_prec_at_thr = calibrate_threshold(
             va_final["bin_targets"], va_final["probs_nt"]
         )
         val_pred_at_thr = apply_calibrated_threshold(va_final["probs_nt"], threshold)
@@ -364,12 +373,23 @@ def train_and_ablate(csv_path=CSV_PATH, epochs=120, batch_size=256, lr=1e-3, pat
     te_pred_at_thr = apply_calibrated_threshold(te["probs_nt"], chosen["threshold"])
     te_metrics_at_thr = binary_confusion_metrics(te["bin_targets"], te_pred_at_thr)
 
+    # Calibração de Alta Sensibilidade: IC exato (Clopper-Pearson) para o
+    # recall pontual -- reportar Recall sem margem de erro, com N positivo
+    # pequeno (~72 no teste), é uma alegação de precisão que os dados não
+    # sustentam.
+    ci_low, ci_high = proportion_confint(
+        count=te_metrics_at_thr["tp"],
+        nobs=te_metrics_at_thr["tp"] + te_metrics_at_thr["fn"],
+        alpha=0.05,
+        method="beta",
+    )
+
     print(f"\n{'=' * 65}\n RESULTADO NO TESTE CEGO (tocado 1x) -- Estrategia: {best_strategy.upper()}\n{'=' * 65}")
     print(f" Operating point ARGMAX (diagnostico, nao usado no pipeline):")
     print(f"   F1-macro={te['f1_macro']:.4f}  Recall={te['tpr_argmax']:.4f}  FPR={te['fpr_argmax']:.4f}")
     print(f" Operating point CALIBRADO (limiar={chosen['threshold']:.4f}; este e' o usado no pipeline):")
-    print(f"   Recall={te_metrics_at_thr['tpr']:.4f}  FPR={te_metrics_at_thr['fpr']:.4f}  "
-          f"Precisao={te_metrics_at_thr['precision']:.4f}")
+    print(f"   Recall={te_metrics_at_thr['tpr']:.4f} (IC 95%: [{ci_low:.4f}, {ci_high:.4f}])  "
+          f"FPR={te_metrics_at_thr['fpr']:.4f}  Precisao={te_metrics_at_thr['precision']:.4f}")
     print(f"   Matriz de confusao (binaria, Cn!=0 = positivo): "
           f"TP={te_metrics_at_thr['tp']}  FN={te_metrics_at_thr['fn']}  "
           f"FP={te_metrics_at_thr['fp']}  TN={te_metrics_at_thr['tn']}")
@@ -386,6 +406,7 @@ def train_and_ablate(csv_path=CSV_PATH, epochs=120, batch_size=256, lr=1e-3, pat
         "threshold": chosen["threshold"],
         "real_prevalence": real_prevalence,
         "test_tpr": te_metrics_at_thr["tpr"],
+        "test_tpr_ci95": (float(ci_low), float(ci_high)),
         "test_fpr": te_metrics_at_thr["fpr"],
         "test_precision_raw": te_metrics_at_thr["precision"],
         "test_confusion": te_metrics_at_thr,
@@ -465,7 +486,7 @@ def benchmark_classical_baselines(X_tr_s, y_tr, X_va_s, y_va, X_te_s, y_te,
         t_fit = time.perf_counter() - t0
 
         probs_va = model.predict_proba(X_va_s)
-        thr, _ = calibrate_threshold_for_full_recall(bin_va, 1.0 - probs_va[:, trivial_idx])
+        thr, _ = calibrate_threshold(bin_va, 1.0 - probs_va[:, trivial_idx])
 
         probs_te = model.predict_proba(X_te_s)
         pred_te = apply_calibrated_threshold(1.0 - probs_te[:, trivial_idx], thr)
