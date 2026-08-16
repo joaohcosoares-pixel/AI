@@ -22,10 +22,10 @@ dados e de simulação aritmética não-empírica):
    (N de positivos é pequeno; ponto isolado sem margem não é honesto).
 3. Pipeline híbrido roda de fato sobre 10^5 pontos novos e reais em R^4:
    forward pass da MLP cronometrado com time.perf_counter(); custo do FHS
-   medido também com perf_counter() (não mais uma constante importada do
-   artigo antigo) numa amostra dos pontos sinalizados, e extrapolado
-   linearmente para o total sinalizado (ou, opcionalmente, auditado por
-   inteiro com fhs_full_audit=True). Nenhuma aritmética fixa.
+   medido com amostragem dupla e independente (região crítica sinalizada vs
+   região trivial não-sinalizada), evitando sobrestimação por viés de borda.
+   Reconstrução ponderada do controle FHS puro e destaque primário para a
+   métrica invariante de Redução de Chamadas ao Oráculo.
 4. A prevalência real (pi) usada na Projeção Bayesiana é lida diretamente da
    distribuição bruta do oráculo FHS (data_generator.generate_dataset), antes
    de qualquer rebalanceamento -- nunca hardcoded.
@@ -585,22 +585,22 @@ def empirical_hybrid_pipeline(model, scaler, classes, trivial_idx: int, threshol
                                maha_percentile: float = 99.5,
                                seed: int = 7) -> dict | None:
     """
-    Demonstracao EMPIRICA (nao mais aritmetica fixa) do pipeline hibrido:
+    Demonstracao EMPIRICA (sem aritmetica fixa) do pipeline hibrido:
 
       1. Sorteia n_eval pontos NOVOS em R^4, dentro dos limites fisicos do
          Hamiltoniano (data_generator._BOUNDS) -- nunca vistos em treino/val/teste.
       2. Mede com time.perf_counter() o tempo REAL do forward pass em lote da
          MLP sobre esses n_eval pontos.
-      3. Aplica o limiar calibrado (Tarefa 2, definido na VALIDACAO) para
-         sinalizar candidatos a Cn != 0.
-      4. Mede com time.perf_counter() o custo REAL do integrador FHS
-         (data_generator.compute_chern_rigorous) numa amostra dos pontos
-         sinalizados -- a amostra e' extraida dos PROPRIOS sinalizados (nao de
-         pontos aleatorios do dominio inteiro), porque sao eles que carregam o
-         viés para perto da fronteira de fechamento de gap, onde o FHS pode
-         ficar mais lento (reavaliacao adaptativa) -- e extrapola linearmente
-         para o total sinalizado. Com fhs_full_audit=True, audita TODOS os
-         sinalizados (sem extrapolacao; mais lento).
+      3. Aplica o limiar calibrado (definido na VALIDACAO) e guarda OOD para
+         sinalizar candidatos criticos a Cn != 0 ou fora de dominio.
+      4. Amostragem Dupla Independente de Custo FHS (data_generator.compute_chern_rigorous):
+         - Amostra 1 (Sinalizados / Criticos): mede tempo medio real (t_fhs_flagged_ms)
+           em pontos proximos a fronteiras de fase e fechamento de gap.
+         - Amostra 2 (Nao-Sinalizados / Triviais): mede tempo medio real (t_fhs_unflagged_ms)
+           em pontos do bulk isolante trivial.
+      5. Reconstrucao ponderada honesta do custo de controle puro e avaliacao
+         do speedup de parede empírico desacoplado, com destaque primario para
+         a Reducao de Chamadas ao Oraculo.
 
     Limitacao explicita: a garantia de Recall=1.0 vem da calibracao na
     validacao (rotulos conhecidos). Para este novo lote de n_eval pontos SEM
@@ -643,14 +643,17 @@ def empirical_hybrid_pipeline(model, scaler, classes, trivial_idx: int, threshol
 
     # 4. limiar calibrado (Tarefa 2) OU fora-de-domínio -- qualquer ponto fora
     # do domínio confiável (bbox OU Mahalanobis) é interceptado e roteado para
-    # o FHS diretamente, IGNORANDO a predição da MLP nesse ponto (mesmo que
-    # ela diga "trivial").
+    # o FHS diretamente, IGNORANDO a predição da MLP nesse ponto
     threshold_mask = probs_nt >= threshold
     flagged_mask = threshold_mask | ood_mask
     flagged_idx = np.where(flagged_mask)[0]
+    unflagged_idx = np.where(~flagged_mask)[0]
+
     n_flagged = int(len(flagged_idx))
+    n_unflagged = int(len(unflagged_idx))
     n_ood = int(ood_mask.sum())
     n_ood_only = int((ood_mask & ~threshold_mask).sum())
+    oracle_reduction_pct = (1.0 - n_flagged / n_eval) * 100.0
 
     print(f" Pontos avaliados pela MLP: {n_eval:,}")
     print(f" Tempo REAL do forward pass (perf_counter): {t_mlp_total * 1000:.2f} ms total "
@@ -659,67 +662,96 @@ def empirical_hybrid_pipeline(model, scaler, classes, trivial_idx: int, threshol
           f"({n_ood / n_eval:.2%}); destes, {n_ood_only:,} não teriam sido sinalizados pelo limiar sozinho")
     print(f" Sinalizados p/ auditoria FHS (limiar={threshold:.4f} OU fora-de-domínio): {n_flagged:,} "
           f"({n_flagged / n_eval:.2%} do lote)")
+    print(f" [MÉTRICA PRIMÁRIA] Redução de Chamadas ao Oráculo FHS: {oracle_reduction_pct:.2f}% "
+          f"({n_eval:,} -> {n_flagged:,} avaliações numéricas)")
 
     if n_flagged == 0:
-        print(" Nenhum ponto sinalizado -- nada a auditar. Pipeline hibrido nao aplicavel neste lote.")
+        print(" Nenhum ponto sinalizado -- nada a auditar. Pipeline híbrido não aplicável neste lote.")
         return None
 
-    # 4. custo do FHS: medido agora, neste hardware, nunca importado de outra fonte
+    # 5. AMOSTRAGEM DUPLA E INDEPENDENTE DE CUSTO FHS
+    # Amostra 1 (Sinalizados / Críticos: fronteira de transição, gap estreito)
     if fhs_full_audit:
-        sample_idx = flagged_idx
-        print(f" fhs_full_audit=True: rodando FHS real em TODOS os {n_flagged:,} sinalizados "
-              f"(sem extrapolacao; pode demorar).")
+        sample_flagged_idx = flagged_idx
+        print(f"\n [Amostra 1 - Crítica] fhs_full_audit=True: rodando FHS real em TODOS os {n_flagged:,} sinalizados...")
     else:
-        k = min(fhs_calibration_sample, n_flagged)
-        sample_idx = rng.choice(flagged_idx, size=k, replace=False)
-        print(f" Medindo custo do FHS numa amostra de {k} pontos sinalizados "
-              f"(nao os {n_flagged:,} inteiros, por custo computacional -- ver docstring); "
-              f"extrapolacao linear a partir dessa medicao real.")
+        k1 = min(fhs_calibration_sample, n_flagged)
+        sample_flagged_idx = rng.choice(flagged_idx, size=k1, replace=False)
+        print(f"\n [Amostra 1 - Crítica] Medindo custo FHS em k1={k1} pontos sinalizados (região de transição)...")
 
     t0 = time.perf_counter()
-    fhs_labels = []
-    for i in sample_idx:
+    fhs_flagged_labels = []
+    for i in sample_flagged_idx:
         c = compute_chern_rigorous(float(Ko[i]), float(h[i]), float(eps2[i]), float(eps3[i]),
                                     N_init=60, n_occ=3)
-        fhs_labels.append(c)
-    t_fhs_sample_total = time.perf_counter() - t0
-    t_fhs_ms_per_point_measured = (t_fhs_sample_total / len(sample_idx)) * 1000.0
+        fhs_flagged_labels.append(c)
+    t_fhs_flagged_sample_total = time.perf_counter() - t0
+    t_fhs_flagged_ms = (t_fhs_flagged_sample_total / len(sample_flagged_idx)) * 1000.0 if len(sample_flagged_idx) > 0 else 0.0
 
-    print(f" Tempo REAL do FHS medido agora (perf_counter), media sobre {len(sample_idx)} "
-          f"avaliacoes reais: {t_fhs_ms_per_point_measured:.4f} ms/ponto")
-
-    if fhs_full_audit:
-        t_fhs_audit_total_sec = t_fhs_sample_total
+    # Amostra 2 (Não-Sinalizados / Triviais: bulk isolante trivial)
+    if n_unflagged > 0:
+        k2 = min(fhs_calibration_sample, n_unflagged)
+        sample_unflagged_idx = rng.choice(unflagged_idx, size=k2, replace=False)
+        print(f" [Amostra 2 - Trivial] Medindo custo FHS em k2={k2} pontos não-sinalizados (bulk trivial)...")
+        t0 = time.perf_counter()
+        fhs_unflagged_labels = []
+        for i in sample_unflagged_idx:
+            c = compute_chern_rigorous(float(Ko[i]), float(h[i]), float(eps2[i]), float(eps3[i]),
+                                        N_init=60, n_occ=3)
+            fhs_unflagged_labels.append(c)
+        t_fhs_unflagged_sample_total = time.perf_counter() - t0
+        t_fhs_unflagged_ms = (t_fhs_unflagged_sample_total / len(sample_unflagged_idx)) * 1000.0
     else:
-        t_fhs_audit_total_sec = (n_flagged * t_fhs_ms_per_point_measured) / 1000.0
+        sample_unflagged_idx = np.array([], dtype=int)
+        t_fhs_unflagged_sample_total = 0.0
+        t_fhs_unflagged_ms = t_fhs_flagged_ms
 
+    # 6. CÁLCULO REALISTA DO CUSTO FHS PURO E HÍBRIDO
+    if fhs_full_audit:
+        t_fhs_audit_total_sec = t_fhs_flagged_sample_total
+    else:
+        t_fhs_audit_total_sec = (n_flagged * t_fhs_flagged_ms) / 1000.0
+
+    t_pure_fhs_total_sec = (n_flagged * t_fhs_flagged_ms + n_unflagged * t_fhs_unflagged_ms) / 1000.0
     t_hybrid_total_sec = t_mlp_total + t_fhs_audit_total_sec
-    t_pure_fhs_total_sec = (n_eval * t_fhs_ms_per_point_measured) / 1000.0
     speedup = t_pure_fhs_total_sec / t_hybrid_total_sec if t_hybrid_total_sec > 0 else float("inf")
 
-    frac_nontrivial_in_sample = float(np.mean([c is not None and c != 0 for c in fhs_labels]))
-    frac_none_in_sample = float(np.mean([c is None for c in fhs_labels]))
+    frac_nontrivial_in_sample = float(np.mean([c is not None and c != 0 for c in fhs_flagged_labels]))
+    frac_none_in_sample = float(np.mean([c is None for c in fhs_flagged_labels]))
 
-    print(f"\n Custo FHS puro estimado p/ {n_eval:,} pts (mesma medicao, mesmo hardware): "
-          f"{t_pure_fhs_total_sec:.2f} s ({t_pure_fhs_total_sec / 60:.1f} min)")
-    print(f" Custo hibrido MEDIDO: MLP({t_mlp_total:.2f}s) + FHS-nos-sinalizados"
-          f"({t_fhs_audit_total_sec:.2f}s) = {t_hybrid_total_sec:.2f} s "
-          f"({t_hybrid_total_sec / 60:.1f} min)")
-    print(f" SPEEDUP MEDIDO: {speedup:.2f}x")
-    print(f" (diagnostico, amostra auditada) fracao confirmada Cn!=0 pelo FHS: "
-          f"{frac_nontrivial_in_sample:.2%}  |  fracao com gap fechado/indefinido (None): "
-          f"{frac_none_in_sample:.2%}")
+    print(f"\n --- CONTRASTE DE LATÊNCIAS FHS MEDIDAS (perf_counter) ---")
+    print(f"  * Tempo FHS Região Crítica/Sinalizada:     {t_fhs_flagged_ms:.4f} ms/ponto (N_amostra={len(sample_flagged_idx)})")
+    print(f"  * Tempo FHS Região Trivial/Não-Sinalizada: {t_fhs_unflagged_ms:.4f} ms/ponto (N_amostra={len(sample_unflagged_idx)})")
+    if t_fhs_unflagged_ms > 0:
+        print(f"  * Razão de lentidão relativa (Crítica/Trivial): {t_fhs_flagged_ms / t_fhs_unflagged_ms:.2f}x")
+
+    print(f"\n --- CUSTOS TEMPORAIS & SPEEDUP (ESTIMATIVA SECUNDÁRIA) ---")
+    print(f" Custo FHS puro ponderado p/ {n_eval:,} pts: {t_pure_fhs_total_sec:.2f} s ({t_pure_fhs_total_sec / 60:.1f} min)")
+    print(f" Custo híbrido MEDIDO: MLP({t_mlp_total:.2f}s) + FHS-sinalizados({t_fhs_audit_total_sec:.2f}s) = "
+          f"{t_hybrid_total_sec:.2f} s ({t_hybrid_total_sec / 60:.1f} min)")
+    print(f" Speedup de parede medido: {speedup:.2f}x (secundário à redução de chamadas)")
+    print(f" (Diagnóstico amostra crítica) Fração confirmada Cn!=0: {frac_nontrivial_in_sample:.2%} | "
+          f"Gap fechado (None): {frac_none_in_sample:.2%}")
 
     return {
-        "n_eval": n_eval, "n_flagged": n_flagged, "threshold": threshold,
-        "n_ood": n_ood, "n_ood_only": n_ood_only, "ood_fraction": n_ood / n_eval,
-        "t_mlp_total_s": t_mlp_total, "t_mlp_ms_per_point": t_mlp_ms_per_point,
-        "t_fhs_ms_per_point_measured": t_fhs_ms_per_point_measured,
+        "n_eval": n_eval,
+        "n_flagged": n_flagged,
+        "n_unflagged": n_unflagged,
+        "oracle_reduction_pct": oracle_reduction_pct,
+        "threshold": threshold,
+        "n_ood": n_ood,
+        "n_ood_only": n_ood_only,
+        "ood_fraction": n_ood / n_eval,
+        "t_mlp_total_s": t_mlp_total,
+        "t_mlp_ms_per_point": t_mlp_ms_per_point,
+        "t_fhs_flagged_ms": t_fhs_flagged_ms,
+        "t_fhs_unflagged_ms": t_fhs_unflagged_ms,
         "t_fhs_audit_total_s": t_fhs_audit_total_sec,
         "t_hybrid_total_s": t_hybrid_total_sec,
         "t_pure_fhs_total_s": t_pure_fhs_total_sec,
         "speedup_measured": speedup,
-        "fhs_sample_size": len(sample_idx),
+        "fhs_flagged_sample_size": len(sample_flagged_idx),
+        "fhs_unflagged_sample_size": len(sample_unflagged_idx),
         "fraction_confirmed_nontrivial_in_sample": frac_nontrivial_in_sample,
         "fraction_gap_closed_in_sample": frac_none_in_sample,
         "full_audit": fhs_full_audit,
@@ -784,5 +816,8 @@ if __name__ == "__main__":
         print(f" Prevalencia real medida (pi):                {result['real_prevalence']:.4%}")
         print(f" Precisao projetada em deployment (Bayes):    {proj_prec:.4%}")
         if hybrid_report is not None:
-            print(f" Speedup medido (empirico, {hybrid_report['n_eval']:,} pts novos, "
-                  f"perf_counter): {hybrid_report['speedup_measured']:.2f}x")
+            print(f"\n [METRICA PRIMARIA] Reducao de Chamadas FHS:  {hybrid_report['oracle_reduction_pct']:.2f}% "
+                  f"({hybrid_report['n_eval']:,} -> {hybrid_report['n_flagged']:,} chamadas)")
+            print(f" Contraste FHS (Critico vs Trivial):          {hybrid_report['t_fhs_flagged_ms']:.4f} ms/pt vs {hybrid_report['t_fhs_unflagged_ms']:.4f} ms/pt")
+            print(f" Speedup de parede ponderado (secundario):    {hybrid_report['speedup_measured']:.2f}x "
+                  f"({hybrid_report['t_pure_fhs_total_s']:.1f}s puro vs {hybrid_report['t_hybrid_total_s']:.1f}s hibrido)")
