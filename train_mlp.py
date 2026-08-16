@@ -464,44 +464,93 @@ def run_multiseed_evaluation(n_trials: int = 20, base_seed: int = 0) -> pd.DataF
 # ══════════════════════════════════════════════════════════════════════════════
 
 def benchmark_classical_baselines(X_tr_s, y_tr, X_va_s, y_va, X_te_s, y_te,
-                                   trivial_idx: int, n_classes: int) -> pd.DataFrame:
+                                   trivial_idx: int, n_classes: int,
+                                   n_seeds: int = 10) -> pd.DataFrame:
     """
     RandomForest(class_weight='balanced') e LogisticRegression(class_weight=
-    'balanced'), no MESMO split/scaler da MLP, com a MESMA regra de calibração
-    de limiar (maior limiar que garante Recall=1.0 na validação).
+    'balanced') avaliados estocasticamente sobre `n_seeds` sementes independentes,
+    no MESMO split/scaler da MLP, com a MESMA regra de calibração de limiar
+    (maior limiar que garante Recall=1.0 na validação) e diagnóstico material
+    do colapso de limiar do RF.
     """
     bin_va = (y_va != trivial_idx).astype(int)
     bin_te = (y_te != trivial_idx).astype(int)
 
-    candidates = {
-        "RandomForest": RandomForestClassifier(n_estimators=300, class_weight="balanced",
-                                                 random_state=42, n_jobs=-1),
-        "LogisticRegression": LogisticRegression(max_iter=2000, class_weight="balanced"),
-    }
+    model_names = ["RandomForest", "LogisticRegression"]
+    all_runs = []
 
-    rows = []
-    for name, model in candidates.items():
-        t0 = time.perf_counter()
-        model.fit(X_tr_s, y_tr)
-        t_fit = time.perf_counter() - t0
+    print(f"\n{'=' * 78}\n BLOCO 2 — BENCHMARKING CLÁSSICO ESTOCÁSTICO ({n_seeds} sementes)\n{'=' * 78}")
 
-        probs_va = model.predict_proba(X_va_s)
-        thr, _ = calibrate_threshold(bin_va, 1.0 - probs_va[:, trivial_idx])
+    for seed in range(n_seeds):
+        models = {
+            "RandomForest": RandomForestClassifier(
+                n_estimators=300, class_weight="balanced", random_state=seed, n_jobs=-1
+            ),
+            "LogisticRegression": LogisticRegression(
+                max_iter=2000, class_weight="balanced", random_state=seed
+            ),
+        }
 
-        probs_te = model.predict_proba(X_te_s)
-        pred_te = apply_calibrated_threshold(1.0 - probs_te[:, trivial_idx], thr)
-        m = binary_confusion_metrics(bin_te, pred_te)
-        f1 = precision_recall_fscore_support(y_te, model.predict(X_te_s),
-                                              average="macro", zero_division=0)[2]
+        for name, model in models.items():
+            t0 = time.perf_counter()
+            model.fit(X_tr_s, y_tr)
+            t_fit = time.perf_counter() - t0
 
-        rows.append({"modelo": name, "f1_macro": f1, "limiar": thr,
-                     "recall_teste": m["tpr"], "fpr_teste": m["fpr"], "fit_time_s": t_fit})
+            probs_va = model.predict_proba(X_va_s)
+            probs_nt_va = 1.0 - probs_va[:, trivial_idx]
 
-    df = pd.DataFrame(rows)
-    print(f"\n{'=' * 78}\n BLOCO 2 — BASELINES CLASSICOS (mesmo split/limiar da MLP)\n{'=' * 78}")
-    print(df.to_string(index=False))
-    df.to_csv("classical_baselines.csv", index=False)
-    return df
+            # Diagnóstico Material do Colapso (RF):
+            if name == "RandomForest":
+                pos_probs_va = probs_nt_va[bin_va == 1]
+                min_pos_prob = float(pos_probs_va.min()) if len(pos_probs_va) > 0 else 0.0
+                zero_count = int((pos_probs_va == 0.0).sum())
+                print(f" Diagnóstico RF [seed {seed}]: Menor probabilidade atribuída a um positivo real = {min_pos_prob:.6f} "
+                      f"({zero_count}/{len(pos_probs_va)} positivos com P(Cn!=0)=0.0 exato)")
+
+            thr, _ = calibrate_threshold(bin_va, probs_nt_va)
+
+            probs_te = model.predict_proba(X_te_s)
+            probs_nt_te = 1.0 - probs_te[:, trivial_idx]
+            pred_te = apply_calibrated_threshold(probs_nt_te, thr)
+            m = binary_confusion_metrics(bin_te, pred_te)
+            f1 = precision_recall_fscore_support(y_te, model.predict(X_te_s),
+                                                  average="macro", zero_division=0)[2]
+
+            all_runs.append({
+                "modelo": name,
+                "seed": seed,
+                "f1_macro": f1,
+                "limiar": thr,
+                "recall_teste": m["tpr"],
+                "fpr_teste": m["fpr"],
+                "fit_time_s": t_fit,
+            })
+
+    df_runs = pd.DataFrame(all_runs)
+
+    # Agregação estatística (μ ± σ)
+    metric_cols = ["f1_macro", "limiar", "recall_teste", "fpr_teste", "fit_time_s"]
+    agg_rows = []
+
+    for name in model_names:
+        sub = df_runs[df_runs["modelo"] == name]
+        row_agg = {"modelo": name}
+        for col in metric_cols:
+            mean_val = float(sub[col].mean())
+            std_val = float(sub[col].std())
+            row_agg[f"{col}_mean"] = mean_val
+            row_agg[f"{col}_std"] = std_val
+            row_agg[col] = f"{mean_val:.4f} ± {std_val:.4f}"
+        agg_rows.append(row_agg)
+
+    df_summary = pd.DataFrame(agg_rows)
+
+    print(f"\n{'=' * 78}\n RESUMO AGREGADO DOS BASELINES CLÁSSICOS (μ ± σ sobre {n_seeds} sementes)\n{'=' * 78}")
+    cols_display = ["modelo"] + metric_cols
+    print(df_summary[cols_display].to_string(index=False))
+
+    df_summary.to_csv("classical_baselines.csv", index=False)
+    return df_summary
 
 
 # ══════════════════════════════════════════════════════════════════════════════
