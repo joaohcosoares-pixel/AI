@@ -665,12 +665,30 @@ def empirical_hybrid_pipeline(model, scaler, classes, trivial_idx: int, threshol
 
     print(f"\n{'=' * 65}\n PIPELINE HIBRIDO -- EXECUCAO EMPIRICA ({n_eval:,} pontos novos)\n{'=' * 65}")
 
-    # 1. pontos novos, reais, nunca vistos por treino/val/teste
-    Ko = rng.uniform(*_BOUNDS["Ko"], n_eval)
-    h = rng.uniform(*_BOUNDS["h"], n_eval)
-    eps2 = rng.uniform(*_BOUNDS["eps2"], n_eval)
-    eps3 = rng.uniform(*_BOUNDS["eps3"], n_eval)
-    X_new = np.stack([Ko, h, eps2, eps3], axis=1).astype(np.float32)
+    # 1. pontos novos com injeção sintética de falhas OOD (95% in-bounds, 5% out-of-bounds)
+    n_in = int(0.95 * n_eval)
+    n_out = n_eval - n_in
+
+    features_list = []
+    for feat in FEATURES:
+        lo, hi = _BOUNDS[feat]
+        span = hi - lo
+        val_in = rng.uniform(lo, hi, n_in)
+        # Amostragem estritamente nas margens externas de 20% fora de _BOUNDS
+        side = rng.choice([0, 1], size=n_out)
+        val_out_low = rng.uniform(lo - 0.20 * span, lo, size=n_out)
+        val_out_high = rng.uniform(hi, hi + 0.20 * span, size=n_out)
+        val_out = np.where(side == 0, val_out_low, val_out_high)
+        features_list.append(np.concatenate([val_in, val_out]))
+
+    X_new = np.stack(features_list, axis=1).astype(np.float32)
+    rng.shuffle(X_new)
+
+    Ko = X_new[:, 0]
+    h = X_new[:, 1]
+    eps2 = X_new[:, 2]
+    eps3 = X_new[:, 3]
+
     X_new_s = scaler.transform(X_new).astype(np.float32)
 
     # 2. forward pass REAL, tempo REAL (perf_counter)
@@ -701,14 +719,17 @@ def empirical_hybrid_pipeline(model, scaler, classes, trivial_idx: int, threshol
     n_flagged = int(len(flagged_idx))
     n_unflagged = int(len(unflagged_idx))
     n_ood = int(ood_mask.sum())
+    n_bbox_rejected = int((~gate["in_bbox"]).sum())
+    n_maha_rejected = int((~gate["in_density"]).sum())
     n_ood_only = int((ood_mask & ~threshold_mask).sum())
     oracle_reduction_pct = (1.0 - n_flagged / n_eval) * 100.0
 
     print(f" Pontos avaliados pela MLP: {n_eval:,}")
     print(f" Tempo REAL do forward pass (perf_counter): {t_mlp_total * 1000:.2f} ms total "
           f"({t_mlp_ms_per_point:.6f} ms/ponto)")
-    print(f" Fora do domínio confiável (bbox ou Mahalanobis p{maha_percentile:g}): {n_ood:,} "
-          f"({n_ood / n_eval:.2%}); destes, {n_ood_only:,} não teriam sido sinalizados pelo limiar sozinho")
+    print(f" Fora do domínio confiável (OOD Interceptados): {n_ood:,} ({n_ood / n_eval:.2%})")
+    print(f"   -> Rejeitados por Bounding Box (Barreira Física): {n_bbox_rejected:,}")
+    print(f"   -> Rejeitados por Mahalanobis (Densidade Espectral p{maha_percentile:g}): {n_maha_rejected:,}")
     print(f" Sinalizados p/ auditoria FHS (limiar={threshold:.4f} OU fora-de-domínio): {n_flagged:,} "
           f"({n_flagged / n_eval:.2%} do lote)")
     print(f" [MÉTRICA PRIMÁRIA] Redução de Chamadas ao Oráculo FHS: {oracle_reduction_pct:.2f}% "
@@ -789,6 +810,8 @@ def empirical_hybrid_pipeline(model, scaler, classes, trivial_idx: int, threshol
         "oracle_reduction_pct": oracle_reduction_pct,
         "threshold": threshold,
         "n_ood": n_ood,
+        "n_bbox_rejected": n_bbox_rejected,
+        "n_maha_rejected": n_maha_rejected,
         "n_ood_only": n_ood_only,
         "ood_fraction": n_ood / n_eval,
         "t_mlp_total_s": t_mlp_total,
@@ -828,8 +851,10 @@ if __name__ == "__main__":
             df_stats.sort_values(["recall", "fpr"], ascending=[True, True])
             .iloc[len(df_stats) // 2]["seed"]
         )
-        print(f"\n{'=' * 65}\n FASE 2: TREINAMENTO DO MODELO DE PRODUÇÃO "
-              f"(SEED={seed_producao}, mediana do ensemble da FASE 1)\n{'=' * 65}")
+        print(f"\n{'=' * 65}\n FASE 2: TREINAMENTO DO MODELO DE PRODUÇÃO\n"
+              f" (SEED={seed_producao}: Selecionada via mediana de Recall. "
+              f"Empates no limite de segurança foram resolvidos priorizando a maior eficiência computacional, i.e., menor FPR)\n"
+              f"{'=' * 65}")
         result, all_candidates = train_and_ablate(epochs=120, batch_size=256, lr=1e-3, seed=seed_producao)
 
         # 2b. BENCHMARK CLÁSSICO -- mesmo split/limiar da MLP escolhida na FASE 2
@@ -857,11 +882,16 @@ if __name__ == "__main__":
         )
 
         # 5. RESUMO EXECUTIVO
+        mean_rec = float(df_stats["recall"].mean())
+        std_rec = float(df_stats["recall"].std())
+        mean_fpr = float(df_stats["fpr"].mean())
+        std_fpr = float(df_stats["fpr"].std())
+
         print(f"\n{'=' * 65}\n RESUMO EXECUTIVO\n{'=' * 65}")
         print(f" Estrategia escolhida (por validacao):      {result['strategy']}")
         print(f" Limiar calibrado (Recall=1.0 na validacao): {result['threshold']:.4f}")
-        print(f" Teste cego (1x), no limiar calibrado:       Recall={result['test_tpr']:.4f}  "
-              f"FPR={result['test_fpr']:.4f}")
+        print(f" Teste cego (Modelo de Produção):           Recall={result['test_tpr']:.4f}  FPR={result['test_fpr']:.4f}")
+        print(f" Comportamento Global (Ensemble):           Recall={mean_rec:.4f} ± {std_rec:.4f}  FPR={mean_fpr:.4f} ± {std_fpr:.4f}")
         print(f" Prevalencia real medida (pi):                {result['real_prevalence']:.4%}")
         print(f" Precisao projetada em deployment (Bayes):    {proj_prec:.4%}")
         if hybrid_report is not None:
