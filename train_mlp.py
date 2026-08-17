@@ -463,25 +463,37 @@ def run_multiseed_evaluation(n_trials: int = 20, base_seed: int = 0) -> pd.DataF
 # BLOCO 2 — BENCHMARKING CLÁSSICO (RandomForest balanceada + Regressão Logística)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def benchmark_classical_baselines(X_tr_s, y_tr, X_va_s, y_va, X_te_s, y_te,
+def benchmark_classical_baselines(X_raw: np.ndarray, y: np.ndarray,
                                    trivial_idx: int, n_classes: int,
                                    n_seeds: int = 10) -> pd.DataFrame:
     """
     RandomForest(class_weight='balanced') e LogisticRegression(class_weight=
     'balanced') avaliados estocasticamente sobre `n_seeds` sementes independentes,
-    no MESMO split/scaler da MLP, com a MESMA regra de calibração de limiar
-    (maior limiar que garante Recall=1.0 na validação) e diagnóstico material
-    do colapso de limiar do RF.
+    com re-split (70/15/15) e padronização (StandardScaler) a cada semente (idêntico
+    à MLP), com a MESMA regra de calibração de limiar (maior limiar que garante
+    Recall=1.0 na validação) e diagnóstico material do colapso de limiar do RF.
     """
-    bin_va = (y_va != trivial_idx).astype(int)
-    bin_te = (y_te != trivial_idx).astype(int)
-
     model_names = ["RandomForest", "LogisticRegression"]
     all_runs = []
 
     print(f"\n{'=' * 78}\n BLOCO 2 — BENCHMARKING CLÁSSICO ESTOCÁSTICO ({n_seeds} sementes)\n{'=' * 78}")
 
     for seed in range(n_seeds):
+        X_tr_val, X_te, y_tr_val, y_te = train_test_split(
+            X_raw, y, test_size=0.15, random_state=seed, stratify=y
+        )
+        X_tr, X_va, y_tr, y_va = train_test_split(
+            X_tr_val, y_tr_val, test_size=0.1765, random_state=seed, stratify=y_tr_val
+        )
+
+        scaler = StandardScaler().fit(X_tr)
+        X_tr_s = scaler.transform(X_tr)
+        X_va_s = scaler.transform(X_va)
+        X_te_s = scaler.transform(X_te)
+
+        bin_va = (y_va != trivial_idx).astype(int)
+        bin_te = (y_te != trivial_idx).astype(int)
+
         models = {
             "RandomForest": RandomForestClassifier(
                 n_estimators=300, class_weight="balanced", random_state=seed, n_jobs=-1
@@ -854,6 +866,13 @@ if __name__ == "__main__":
     if not CSV_PATH.exists():
         print(f"ERRO: Dataset {CSV_PATH} nao encontrado. Execute data_generator.py primeiro.")
     else:
+        df_raw = pd.read_csv(CSV_PATH)
+        X_raw = df_raw[FEATURES].values.astype(np.float32)
+        y_raw = df_raw["chern"].values
+        classes = np.sort(np.unique(y_raw))
+        c2i = {int(c): i for i, c in enumerate(classes)}
+        y = np.array([c2i[int(c)] for c in y_raw], dtype=np.int64)
+
         # 1. AUDITORIA ESTATÍSTICA (Comprovação de estabilidade exigida pelo Bloco 1)
         print(f"\n{'=' * 65}\n FASE 1: AUDITORIA ESTOCÁSTICA (ENSEMBLE DE SEMENTES)\n{'=' * 65}")
         df_stats = run_multiseed_evaluation(n_trials=30, base_seed=0)
@@ -873,10 +892,9 @@ if __name__ == "__main__":
               f"{'=' * 65}")
         result, all_candidates = train_and_ablate(epochs=120, batch_size=256, lr=1e-3, seed=seed_producao)
 
-        # 2b. BENCHMARK CLÁSSICO -- mesmo split/limiar da MLP escolhida na FASE 2
+        # 2b. BENCHMARK CLÁSSICO -- re-split e treino estocástico a cada semente
         baseline_df = benchmark_classical_baselines(
-            result["X_tr_s"], result["y_tr"], result["X_va_s"], result["y_va"],
-            result["X_te_s"], result["y_te"], result["trivial_idx"], result["n_classes"],
+            X_raw, y, result["trivial_idx"], result["n_classes"], n_seeds=10
         )
 
         # 3. PROJEÇÃO BAYESIANA
@@ -906,11 +924,14 @@ if __name__ == "__main__":
         print(f"\n{'=' * 65}\n RESUMO EXECUTIVO\n{'=' * 65}")
         print(f" Estrategia escolhida (por validacao):      {result['strategy']}")
         print(f" Limiar calibrado (Recall=1.0 na validacao): {result['threshold']:.4f}")
-        print(f" Teste cego (Modelo de Produção):           Recall={result['test_tpr']:.4f}  FPR={result['test_fpr']:.4f}")
+        print(f" Teste cego (Semente Mediana Illustrativa*): Recall={result['test_tpr']:.4f}  FPR={result['test_fpr']:.4f}")
         print(f" Comportamento Global (Ensemble):           Recall={mean_rec:.4f} ± {std_rec:.4f}  FPR={mean_fpr:.4f} ± {std_fpr:.4f}")
+        print(f" * Nota Metodológica: O modelo de produção ilustra a mediana da distribuição agregada para fins de deployment, não constituindo uma validação duplamente cega independente.")
         print(f" Prevalencia real medida (pi):                {result['real_prevalence']:.4%}")
         print(f" Precisao projetada em deployment (Bayes):    {proj_prec:.4%}")
         if hybrid_report is not None:
+            print(f"\n Robustez OOD (Lote Adv. {hybrid_report['n_adv']:,} pts): {hybrid_report['adv_n_ood']:,} interceptados")
+            print(f" (BBox: {hybrid_report['adv_n_bbox']:,} | Mahalanobis: {hybrid_report['adv_n_maha']:,} | Interseção: {hybrid_report['adv_n_bbox_and_maha']:,})")
             print(f"\n [METRICA PRIMARIA] Reducao de Chamadas FHS:  {hybrid_report['oracle_reduction_pct']:.2f}% "
                   f"({hybrid_report['n_eval']:,} -> {hybrid_report['n_flagged']:,} chamadas)")
             print(f" Contraste FHS (Critico vs Trivial):          {hybrid_report['t_fhs_flagged_ms']:.4f} ms/pt vs {hybrid_report['t_fhs_unflagged_ms']:.4f} ms/pt")
