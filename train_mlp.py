@@ -634,65 +634,85 @@ def empirical_hybrid_pipeline(model, scaler, classes, trivial_idx: int, threshol
                                maha_percentile: float = 99.5,
                                seed: int = 7) -> dict | None:
     """
-    Demonstracao EMPIRICA (sem aritmetica fixa) do pipeline hibrido:
+    Demonstracao EMPIRICA desacoplada (sem aritmetica fixa) do pipeline hibrido:
 
-      1. Sorteia n_eval pontos NOVOS em R^4, dentro dos limites fisicos do
-         Hamiltoniano (data_generator._BOUNDS) -- nunca vistos em treino/val/teste.
-      2. Mede com time.perf_counter() o tempo REAL do forward pass em lote da
-         MLP sobre esses n_eval pontos.
-      3. Aplica o limiar calibrado (definido na VALIDACAO) e guarda OOD para
-         sinalizar candidatos criticos a Cn != 0 ou fora de dominio.
-      4. Amostragem Dupla Independente de Custo FHS (data_generator.compute_chern_rigorous):
-         - Amostra 1 (Sinalizados / Criticos): mede tempo medio real (t_fhs_flagged_ms)
-           em pontos proximos a fronteiras de fase e fechamento de gap.
-         - Amostra 2 (Nao-Sinalizados / Triviais): mede tempo medio real (t_fhs_unflagged_ms)
-           em pontos do bulk isolante trivial.
-      5. Reconstrucao ponderada honesta do custo de controle puro e avaliacao
-         do speedup de parede empírico desacoplado, com destaque primario para
-         a Reducao de Chamadas ao Oraculo.
+      Experimento A (Robustez OOD):
+        - Lote adversarial isolado de 10.000 pontos (5.000 in-bounds + 5.000 out-of-bounds com margem de 20%).
+        - Avaliacao exclusiva pelo TopoDomainGuard (Bounding Box fisico + Mahalanobis espectral).
+        - Contabilidade precisa de rejeicoes e intersecao geometrica entre filtros.
 
-    Limitacao explicita: a garantia de Recall=1.0 vem da calibracao na
-    validacao (rotulos conhecidos). Para este novo lote de n_eval pontos SEM
-    rotulo, nao recomputamos TPR/FPR reais -- isso exigiria rodar FHS nos
-    n_eval pontos inteiros, o que anularia o proprio objetivo do pipeline. A
-    garantia e', portanto, uma extrapolacao da validacao para a nova amostra,
-    valida na medida em que a validacao for representativa do dominio D subset
-    R^4 amostrado por data_generator.generate_dataset.
+      Experimento B (Eficiencia de Parede em Producao):
+        - Sorteia n_eval (100.000) pontos NOVOS 100% dentro dos limites fisicos (_BOUNDS).
+        - Mede tempo REAL (perf_counter) do forward pass da MLP.
+        - Aplica limiar calibrado + guarda OOD em cenario de producao limpo e realista.
+        - Amostragem Dupla Independente de Custo FHS (regiao critica sinalizada vs regiao trivial).
+        - Avaliacao honesta e despoluida de Speedup e Reducao de Chamadas ao Oraculo.
     """
     rng = np.random.default_rng(seed)
     device = next(model.parameters()).device
     model.eval()
 
-    print(f"\n{'=' * 65}\n PIPELINE HIBRIDO -- EXECUCAO EMPIRICA ({n_eval:,} pontos novos)\n{'=' * 65}")
+    print(f"\n{'=' * 65}\n PIPELINE HIBRIDO -- AVALIACAO EMPIRICA DESACOPLADA\n{'=' * 65}")
 
-    # 1. pontos novos com injeção sintética de falhas OOD (95% in-bounds, 5% out-of-bounds)
-    n_in = int(0.95 * n_eval)
-    n_out = n_eval - n_in
+    guard = TopoDomainGuard(_BOUNDS, scaler, X_train_scaled=X_train_scaled, maha_percentile=maha_percentile)
 
-    features_list = []
+    # ══════════════════════════════════════════════════════════════════════════
+    # EXPERIMENTO A: ROBUSTEZ (LOTE ADVERSARIAL OOD - 10k pts)
+    # ══════════════════════════════════════════════════════════════════════════
+    n_adv = 10_000
+    n_adv_in = 5_000
+    n_adv_out = 5_000
+
+    features_list_adv = []
     for feat in FEATURES:
         lo, hi = _BOUNDS[feat]
         span = hi - lo
-        val_in = rng.uniform(lo, hi, n_in)
+        val_in = rng.uniform(lo, hi, n_adv_in)
         # Amostragem estritamente nas margens externas de 20% fora de _BOUNDS
-        side = rng.choice([0, 1], size=n_out)
-        val_out_low = rng.uniform(lo - 0.20 * span, lo, size=n_out)
-        val_out_high = rng.uniform(hi, hi + 0.20 * span, size=n_out)
+        side = rng.choice([0, 1], size=n_adv_out)
+        val_out_low = rng.uniform(lo - 0.20 * span, lo, size=n_adv_out)
+        val_out_high = rng.uniform(hi, hi + 0.20 * span, size=n_adv_out)
         val_out = np.where(side == 0, val_out_low, val_out_high)
-        features_list.append(np.concatenate([val_in, val_out]))
+        features_list_adv.append(np.concatenate([val_in, val_out]))
 
-    X_new = np.stack(features_list, axis=1).astype(np.float32)
-    rng.shuffle(X_new)
+    X_adv = np.stack(features_list_adv, axis=1).astype(np.float32)
+    rng.shuffle(X_adv)
 
-    Ko = X_new[:, 0]
-    h = X_new[:, 1]
-    eps2 = X_new[:, 2]
-    eps3 = X_new[:, 3]
+    gate_adv = guard.check(X_adv)
+    ood_mask_adv = ~gate_adv["trusted"]
 
-    X_new_s = scaler.transform(X_new).astype(np.float32)
+    n_adv_ood = int(ood_mask_adv.sum())
+    n_adv_bbox = int((~gate_adv["in_bbox"]).sum())
+    n_adv_maha = int((~gate_adv["in_density"]).sum())
+    n_adv_bbox_and_maha = int((~gate_adv["in_bbox"] & ~gate_adv["in_density"]).sum())
 
-    # 2. forward pass REAL, tempo REAL (perf_counter)
-    X_tensor = torch.from_numpy(X_new_s).to(device)
+    print(f"\n [AVALIAÇÃO DE ROBUSTEZ - Lote Adversarial 10k pts]")
+    print(f" Total de pontos adversariais testados: {n_adv:,} (5.000 in-bounds + 5.000 out-of-bounds)")
+    print(f" Fora do domínio confiável (OOD Interceptados): {n_adv_ood:,} ({n_adv_ood / n_adv:.2%})")
+    print(f"   -> Barrados por Bounding Box (Barreira Física): {n_adv_bbox:,}")
+    print(f"   -> Barrados por Mahalanobis (Densidade Espectral p{maha_percentile:g}): {n_adv_maha:,}")
+    print(f"   -> Interseção Geométrica (Barrados por Ambos): {n_adv_bbox_and_maha:,}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # EXPERIMENTO B: EFICIÊNCIA DE PAREDE (LOTE LIMPO DE PRODUÇÃO - 100k pts)
+    # ══════════════════════════════════════════════════════════════════════════
+    features_list_clean = []
+    for feat in FEATURES:
+        lo, hi = _BOUNDS[feat]
+        val_clean = rng.uniform(lo, hi, n_eval)
+        features_list_clean.append(val_clean)
+
+    X_clean = np.stack(features_list_clean, axis=1).astype(np.float32)
+
+    Ko = X_clean[:, 0]
+    h = X_clean[:, 1]
+    eps2 = X_clean[:, 2]
+    eps3 = X_clean[:, 3]
+
+    X_clean_s = scaler.transform(X_clean).astype(np.float32)
+
+    # 1. Forward pass da MLP no lote limpo de produção
+    X_tensor = torch.from_numpy(X_clean_s).to(device)
     with torch.no_grad():
         t0 = time.perf_counter()
         logits = model(X_tensor)
@@ -703,34 +723,27 @@ def empirical_hybrid_pipeline(model, scaler, classes, trivial_idx: int, threshol
     probs_nt = (1.0 - probs[:, trivial_idx]).cpu().numpy()
     t_mlp_ms_per_point = (t_mlp_total / n_eval) * 1000.0
 
-    # 3. GATE DE DOMÍNIO -- instanciado com X_tr_s da rede de produção
-    guard = TopoDomainGuard(_BOUNDS, scaler, X_train_scaled=X_train_scaled, maha_percentile=maha_percentile)
-    gate = guard.check(X_new)
-    ood_mask = ~gate["trusted"]
+    # 2. Gate de domínio no lote limpo
+    gate_clean = guard.check(X_clean)
+    ood_mask_clean = ~gate_clean["trusted"]
+    n_ood_clean = int(ood_mask_clean.sum())
 
-    # 4. limiar calibrado (Tarefa 2) OU fora-de-domínio -- qualquer ponto fora
-    # do domínio confiável (bbox OU Mahalanobis) é interceptado e roteado para
-    # o FHS diretamente, IGNORANDO a predição da MLP nesse ponto
-    threshold_mask = probs_nt >= threshold
-    flagged_mask = threshold_mask | ood_mask
-    flagged_idx = np.where(flagged_mask)[0]
-    unflagged_idx = np.where(~flagged_mask)[0]
+    # 3. Triagem de produção: limiar calibrado OU fora de domínio
+    threshold_mask_clean = probs_nt >= threshold
+    flagged_mask_clean = threshold_mask_clean | ood_mask_clean
+    flagged_idx = np.where(flagged_mask_clean)[0]
+    unflagged_idx = np.where(~flagged_mask_clean)[0]
 
     n_flagged = int(len(flagged_idx))
     n_unflagged = int(len(unflagged_idx))
-    n_ood = int(ood_mask.sum())
-    n_bbox_rejected = int((~gate["in_bbox"]).sum())
-    n_maha_rejected = int((~gate["in_density"]).sum())
-    n_ood_only = int((ood_mask & ~threshold_mask).sum())
     oracle_reduction_pct = (1.0 - n_flagged / n_eval) * 100.0
 
+    print(f"\n [AVALIAÇÃO DE EFICIÊNCIA - Lote Limpo {n_eval // 1000}k pts]")
     print(f" Pontos avaliados pela MLP: {n_eval:,}")
     print(f" Tempo REAL do forward pass (perf_counter): {t_mlp_total * 1000:.2f} ms total "
           f"({t_mlp_ms_per_point:.6f} ms/ponto)")
-    print(f" Fora do domínio confiável (OOD Interceptados): {n_ood:,} ({n_ood / n_eval:.2%})")
-    print(f"   -> Rejeitados por Bounding Box (Barreira Física): {n_bbox_rejected:,}")
-    print(f"   -> Rejeitados por Mahalanobis (Densidade Espectral p{maha_percentile:g}): {n_maha_rejected:,}")
-    print(f" Sinalizados p/ auditoria FHS (limiar={threshold:.4f} OU fora-de-domínio): {n_flagged:,} "
+    print(f" Fora do domínio confiável no lote limpo: {n_ood_clean:,} ({n_ood_clean / n_eval:.2%})")
+    print(f" Sinalizados p/ auditoria FHS (limiar={threshold:.4f} OU OOD): {n_flagged:,} "
           f"({n_flagged / n_eval:.2%} do lote)")
     print(f" [MÉTRICA PRIMÁRIA] Redução de Chamadas ao Oráculo FHS: {oracle_reduction_pct:.2f}% "
           f"({n_eval:,} -> {n_flagged:,} avaliações numéricas)")
@@ -739,7 +752,7 @@ def empirical_hybrid_pipeline(model, scaler, classes, trivial_idx: int, threshol
         print(" Nenhum ponto sinalizado -- nada a auditar. Pipeline híbrido não aplicável neste lote.")
         return None
 
-    # 5. AMOSTRAGEM DUPLA E INDEPENDENTE DE CUSTO FHS
+    # 4. AMOSTRAGEM DUPLA E INDEPENDENTE DE CUSTO FHS
     # Amostra 1 (Sinalizados / Críticos: fronteira de transição, gap estreito)
     if fhs_full_audit:
         sample_flagged_idx = flagged_idx
@@ -776,7 +789,7 @@ def empirical_hybrid_pipeline(model, scaler, classes, trivial_idx: int, threshol
         t_fhs_unflagged_sample_total = 0.0
         t_fhs_unflagged_ms = t_fhs_flagged_ms
 
-    # 6. CÁLCULO REALISTA DO CUSTO FHS PURO E HÍBRIDO
+    # 5. CÁLCULO REALISTA DO CUSTO FHS PURO E HÍBRIDO
     if fhs_full_audit:
         t_fhs_audit_total_sec = t_fhs_flagged_sample_total
     else:
@@ -804,16 +817,13 @@ def empirical_hybrid_pipeline(model, scaler, classes, trivial_idx: int, threshol
           f"Gap fechado (None): {frac_none_in_sample:.2%}")
 
     return {
+        # Métricas do Lote Limpo (Produção / Eficiência)
         "n_eval": n_eval,
         "n_flagged": n_flagged,
         "n_unflagged": n_unflagged,
         "oracle_reduction_pct": oracle_reduction_pct,
         "threshold": threshold,
-        "n_ood": n_ood,
-        "n_bbox_rejected": n_bbox_rejected,
-        "n_maha_rejected": n_maha_rejected,
-        "n_ood_only": n_ood_only,
-        "ood_fraction": n_ood / n_eval,
+        "n_ood_clean": n_ood_clean,
         "t_mlp_total_s": t_mlp_total,
         "t_mlp_ms_per_point": t_mlp_ms_per_point,
         "t_fhs_flagged_ms": t_fhs_flagged_ms,
@@ -827,6 +837,12 @@ def empirical_hybrid_pipeline(model, scaler, classes, trivial_idx: int, threshol
         "fraction_confirmed_nontrivial_in_sample": frac_nontrivial_in_sample,
         "fraction_gap_closed_in_sample": frac_none_in_sample,
         "full_audit": fhs_full_audit,
+        # Métricas do Lote Adversarial (Robustez OOD)
+        "n_adv": n_adv,
+        "adv_n_ood": n_adv_ood,
+        "adv_n_bbox": n_adv_bbox,
+        "adv_n_maha": n_adv_maha,
+        "adv_n_bbox_and_maha": n_adv_bbox_and_maha,
     }
 
 
