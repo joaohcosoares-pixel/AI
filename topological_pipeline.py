@@ -43,6 +43,8 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from domain_guard import TopoDomainGuard
+
 warnings.filterwarnings("ignore")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -458,17 +460,35 @@ def train_classifier(csv_path: Path = BALANCED_CSV_PATH, epochs: int = 200,
 # INFERÊNCIA COM CONFIANÇA (reduz "alucinação" em pontos incertos)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def predict_chern(model, scaler, classes, Ko, h, eps2, eps3, threshold=0.5):
+def predict_chern(
+    model: nn.Module,
+    scaler: StandardScaler,
+    classes: np.ndarray,
+    Ko: float,
+    h: float,
+    eps2: float,
+    eps3: float,
+    guard: Optional[TopoDomainGuard] = None,
+    threshold: float = 0.5,
+) -> Tuple[Optional[int], float]:
     """
-    Prediz o número de Chern com probabilidade de confiança.
+    Prediz o número de Chern com probabilidade de confiança e contenção OOD.
 
-    Retorna (chern, confiança) onde 'confiança' é a probabilidade softmax da
-    classe prevista. Se confiança < threshold, o ponto está numa região de
-    fronteira/incerta — o modelo avisa em vez de "chutar".
+    Se guard for fornecido, executa primeiro a contenção pelo TopoDomainGuard.
+    Se o ponto for OOD (ood_mask=True), descarta sumariamente a inferência da MLP.
+    Caso contrário, avalia o limiar de confiança softmax.
     """
+    x_raw = np.array([[Ko, h, eps2, eps3]], dtype=np.float32)
+
+    if guard is not None:
+        guard_res = guard.check(x_raw)
+        if guard_res["ood_mask"]:
+            reason = "Bounding Box violado" if not guard_res["in_bbox"] else "Densidade espectral fora do domínio"
+            print(f"[REJEIÇÃO OOD] Ponto fora do domínio ({reason})! Encaminhando obrigatoriamente ao Oráculo FHS.")
+            return None, 0.0
+
     device = next(model.parameters()).device
-    x = np.array([[Ko, h, eps2, eps3]], dtype=np.float32)
-    x_scaled = scaler.transform(x)
+    x_scaled = scaler.transform(x_raw)
     with torch.no_grad():
         logits = model(torch.from_numpy(x_scaled).to(device))
         probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]

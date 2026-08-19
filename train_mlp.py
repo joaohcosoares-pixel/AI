@@ -67,6 +67,7 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
 
 from data_generator import _BOUNDS, compute_chern_rigorous
+from domain_guard import TopoDomainGuard
 
 warnings.filterwarnings("ignore")
 
@@ -604,6 +605,7 @@ def run_symmetric_multiseed_evaluation(
         mlp_registry[seed] = {
             "model": mlp_res["model"],
             "scaler": scaler,
+            "X_train_scaled": X_tr_s,
             "threshold": mlp_res["threshold"],
             "strategy": mlp_res["strategy"],
             "selection_key": mlp_res["selection_key"],
@@ -866,50 +868,121 @@ def bayesian_precision_projection(
 # MÓDULO 9 — GUARDA DE DOMÍNIO OOD E SIMULAÇÃO EMPÍRICA DO PIPELINE HÍBRIDO
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TopoDomainGuard:
+def predict_with_domain_guard(
+    model: nn.Module,
+    scaler: StandardScaler,
+    guard: TopoDomainGuard,
+    classes: np.ndarray,
+    trivial_idx: int,
+    M: float,
+    p2: float,
+    p3: float,
+    p4: float,
+    threshold: float = 0.5,
+    device: Optional[torch.device] = None,
+) -> Dict[str, Any]:
     """
-    Guarda de Domínio Fora de Distribuição (Out-Of-Distribution - OOD).
-    Combina verificação de Bounding Box físico e Distância de Mahalanobis calibrada
-    no espaço padronizado de treinamento.
+    Predição de fase topológica para uma única amostra com Guarda de Domínio OOD.
+
+    Aplica a política estrita de contenção:
+      1. Checagem de Bounding Box Físico e Densidade Espectral (Mahalanobis).
+      2. Se ood_mask = True, a predição da MLP é sumariamente descartada
+         e o ponto é marcado para cálculo mandatório pelo Oráculo FHS.
+      3. Se confiável no domínio, avalia o limiar de triagem P(Cn != 0) >= threshold.
     """
+    if device is None:
+        device = next(model.parameters()).device
+    model.eval()
 
-    def __init__(
-        self,
-        bounds: Dict[str, Tuple[float, float]],
-        scaler: StandardScaler,
-        X_train_scaled: np.ndarray,
-        maha_percentile: float = 99.5,
-    ) -> None:
-        self.bounds = bounds
-        self.scaler = scaler
-        self.mu = X_train_scaled.mean(axis=0)
-        cov = np.cov(X_train_scaled, rowvar=False)
-        self.cov_inv = np.linalg.inv(cov + 1e-6 * np.eye(cov.shape[0]))
-        self.maha_threshold = float(
-            np.percentile(self._mahalanobis(X_train_scaled), maha_percentile)
-        )
+    x_raw = np.array([[M, p2, p3, p4]], dtype=np.float32)
+    guard_res = guard.check(x_raw)
 
-    def _mahalanobis(self, X_scaled: np.ndarray) -> np.ndarray:
-        d = X_scaled - self.mu
-        return np.sqrt(np.einsum("ij,jk,ik->i", d, self.cov_inv, d))
+    in_bbox = bool(guard_res["in_bbox"])
+    in_density = bool(guard_res["in_density"])
+    ood_mask = bool(guard_res["ood_mask"])
+    maha_dist = float(guard_res["maha_dist"])
 
-    def check(
-        self,
-        X_raw: np.ndarray,
-        feature_order: Tuple[str, ...] = ("M", "p2", "p3", "p4"),
-    ) -> Dict[str, Any]:
-        in_bbox = np.ones(len(X_raw), dtype=bool)
-        for j, name in enumerate(feature_order):
-            lo, hi = self.bounds[name]
-            in_bbox &= (X_raw[:, j] >= lo) & (X_raw[:, j] <= hi)
-        maha_dist = self._mahalanobis(self.scaler.transform(X_raw))
-        in_density = maha_dist <= self.maha_threshold
-        return {
-            "trusted": in_bbox & in_density,
-            "in_bbox": in_bbox,
-            "in_density": in_density,
-            "maha_dist": maha_dist,
-        }
+    x_scaled = scaler.transform(x_raw).astype(np.float32)
+    with torch.no_grad():
+        x_tensor = torch.from_numpy(x_scaled).to(device)
+        logits = model(x_tensor)
+        probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+
+    pred_idx = int(np.argmax(probs))
+    pred_chern = int(classes[pred_idx])
+    confidence = float(probs[pred_idx])
+    prob_nt = float(1.0 - probs[trivial_idx])
+    threshold_mask = bool(prob_nt >= threshold)
+    flagged_for_oracle = bool(threshold_mask or ood_mask)
+
+    return {
+        "pred_chern": pred_chern if not ood_mask else None,
+        "raw_mlp_chern": pred_chern,
+        "confidence": confidence,
+        "prob_nt": prob_nt,
+        "in_bbox": in_bbox,
+        "in_density": in_density,
+        "ood_mask": ood_mask,
+        "threshold_mask": threshold_mask,
+        "flagged_for_oracle": flagged_for_oracle,
+        "maha_dist": maha_dist,
+        "action": "ORACLE_FHS_REQUIRED" if flagged_for_oracle else "TRUSTED_MLP_PREDICTION",
+        "ood_reason": (
+            "OUT_OF_BOUNDING_BOX" if not in_bbox
+            else ("OUT_OF_SPECTRAL_DENSITY" if not in_density else "NONE")
+        ),
+    }
+
+
+def batch_predict_with_domain_guard(
+    model: nn.Module,
+    scaler: StandardScaler,
+    guard: TopoDomainGuard,
+    classes: np.ndarray,
+    trivial_idx: int,
+    X_raw: np.ndarray,
+    threshold: float = 0.5,
+    device: Optional[torch.device] = None,
+) -> Dict[str, Any]:
+    """
+    Inferência em lote 100% vetorizada com contenção OOD e política de fallback ao oráculo.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+    model.eval()
+
+    X_raw_arr = np.asarray(X_raw, dtype=np.float32)
+    X_scaled = scaler.transform(X_raw_arr).astype(np.float32)
+
+    with torch.no_grad():
+        X_tensor = torch.from_numpy(X_scaled).to(device)
+        logits = model(X_tensor)
+        probs = torch.softmax(logits, dim=-1).cpu().numpy()
+
+    preds_idx = np.argmax(probs, axis=-1)
+    preds_chern = classes[preds_idx]
+    probs_nt = 1.0 - probs[:, trivial_idx]
+
+    routing = guard.route_inference(X_raw_arr, probs_nt, threshold=threshold)
+
+    # Predições confiáveis: mantidas apenas quando o ponto não é OOD
+    trusted_preds = np.where(~routing["ood_mask"], preds_chern, np.nan)
+
+    return {
+        "preds_chern": trusted_preds,
+        "raw_mlp_preds": preds_chern,
+        "probs_nt": probs_nt,
+        "in_bbox": routing["in_bbox"],
+        "in_density": routing["in_density"],
+        "ood_mask": routing["ood_mask"],
+        "threshold_mask": routing["threshold_mask"],
+        "flagged_for_oracle": routing["flagged_for_oracle"],
+        "maha_dist": routing["maha_dist"],
+        "n_total": routing["n_total"],
+        "n_flagged": routing["n_flagged"],
+        "n_ood_intercepted": routing["n_ood_intercepted"],
+        "oracle_reduction_pct": routing["oracle_reduction_pct"],
+    }
 
 
 def empirical_hybrid_pipeline(
@@ -933,30 +1006,49 @@ def empirical_hybrid_pipeline(
     model.eval()
 
     print(f"\n{'=' * 86}")
-    print(" PIPELINE HÍBRIDO — AVALIAÇÃO EMPÍRICA EM 10^5 PONTOS REAIS")
+    print(" PIPELINE HÍBRIDO — AVALIAÇÃO EMPÍRICA EM 10^5 PONTOS REAIS COM GUARDA OOD")
     print(f"{'=' * 86}")
 
     guard = TopoDomainGuard(
-        _BOUNDS, scaler, X_train_scaled=X_train_scaled, maha_percentile=maha_percentile
+        bounds=_BOUNDS,
+        scaler=scaler,
+        X_train_scaled=X_train_scaled,
+        maha_percentile=maha_percentile,
+        epsilon=1e-6,
     )
 
-    # ── Experimento A: Robustez Adversarial OOD ──
+    # ── Experimento A: Robustez Adversarial OOD (BBox + Covariate Shift no BBox) ──
     n_adv = 10_000
-    n_adv_in = 5_000
-    n_adv_out = 5_000
+    n_adv_in_bbox_shift = 5_000
+    n_adv_out_bbox = 5_000
 
-    features_list_adv = []
+    # 1. Pontos fora do Bounding Box físico
+    features_out = []
     for feat in FEATURES:
         lo, hi = _BOUNDS[feat]
         span = hi - lo
-        val_in = rng.uniform(lo, hi, n_adv_in)
-        side = rng.choice([0, 1], size=n_adv_out)
-        val_out_low = rng.uniform(lo - 0.20 * span, lo, size=n_adv_out)
-        val_out_high = rng.uniform(hi, hi + 0.20 * span, size=n_adv_out)
-        val_out = np.where(side == 0, val_out_low, val_out_high)
-        features_list_adv.append(np.concatenate([val_in, val_out]))
+        side = rng.choice([0, 1], size=n_adv_out_bbox)
+        val_out_low = rng.uniform(lo - 0.25 * span, lo, size=n_adv_out_bbox)
+        val_out_high = rng.uniform(hi, hi + 0.25 * span, size=n_adv_out_bbox)
+        features_out.append(np.where(side == 0, val_out_low, val_out_high))
+    X_adv_out = np.stack(features_out, axis=1).astype(np.float32)
 
-    X_adv = np.stack(features_list_adv, axis=1).astype(np.float32)
+    # 2. Pontos DENTRO do Bounding Box, mas com Covariate Shift / correlação anômala não vista
+    #    (amostrados nos vértices e cantos do hipercubo onde a densidade espectral é anômala)
+    M_lo, M_hi = _BOUNDS["M"]
+    p_lo, p_hi = -1.0, 1.0
+    corner_M = rng.choice([M_lo + 0.01, M_hi - 0.01], size=n_adv_in_bbox_shift)
+    corner_p2 = rng.choice([p_lo + 0.01, p_hi - 0.01], size=n_adv_in_bbox_shift)
+    corner_p3 = rng.choice([p_lo + 0.01, p_hi - 0.01], size=n_adv_in_bbox_shift)
+    corner_p4 = rng.choice([p_lo + 0.01, p_hi - 0.01], size=n_adv_in_bbox_shift)
+    noise = rng.normal(0, 0.02, size=(n_adv_in_bbox_shift, 4))
+    X_adv_in = np.stack([corner_M, corner_p2, corner_p3, corner_p4], axis=1).astype(np.float32) + noise
+    # Garante que X_adv_in permaneça estritamente dentro do BBox para testar Mahalanobis
+    for j, feat in enumerate(FEATURES):
+        lo, hi = _BOUNDS[feat]
+        X_adv_in[:, j] = np.clip(X_adv_in[:, j], lo + 1e-4, hi - 1e-4)
+
+    X_adv = np.vstack([X_adv_out, X_adv_in])
     rng.shuffle(X_adv)
 
     gate_adv = guard.check(X_adv)
@@ -976,7 +1068,10 @@ def empirical_hybrid_pipeline(
         features_list_clean.append(rng.uniform(lo, hi, n_eval))
 
     X_clean = np.stack(features_list_clean, axis=1).astype(np.float32)
-    Ko, h, eps2, eps3 = X_clean[:, 0], X_clean[:, 1], X_clean[:, 2], X_clean[:, 3]
+    M_clean = X_clean[:, 0]
+    p2_clean = X_clean[:, 1]
+    p3_clean = X_clean[:, 2]
+    p4_clean = X_clean[:, 3]
     X_clean_s = scaler.transform(X_clean).astype(np.float32)
 
     X_tensor = torch.from_numpy(X_clean_s).to(device)
@@ -991,74 +1086,295 @@ def empirical_hybrid_pipeline(
     probs_nt = (1.0 - probs[:, trivial_idx]).cpu().numpy()
     t_mlp_ms_per_point = (t_mlp_total / n_eval) * 1000.0
 
-    gate_clean = guard.check(X_clean)
-    ood_mask_clean = ~gate_clean["trusted"]
-    threshold_mask_clean = probs_nt >= threshold
-    flagged_mask_clean = threshold_mask_clean | ood_mask_clean
+    routing_clean = guard.route_inference(X_clean, probs_nt, threshold=threshold)
+    flagged_mask_clean = routing_clean["flagged_for_oracle"]
 
     flagged_idx = np.where(flagged_mask_clean)[0]
     unflagged_idx = np.where(~flagged_mask_clean)[0]
 
     n_flagged = int(len(flagged_idx))
     n_unflagged = int(len(unflagged_idx))
-    oracle_reduction_pct = (1.0 - n_flagged / n_eval) * 100.0
+    oracle_reduction_pct = routing_clean["oracle_reduction_pct"]
 
     print(f"\n [EXPERIMENTO B: Eficiência em Produção — Lote de {n_eval // 1000}k pts]")
     print(f" Tempo total forward pass MLP: {t_mlp_total * 1000:.2f} ms ({t_mlp_ms_per_point:.6f} ms/pt)")
     print(f" Pontos sinalizados para auditoria FHS: {n_flagged:,} ({n_flagged / n_eval:.2%})")
     print(f" [MÉTRICA PRIMÁRIA] Redução de Chamadas ao Oráculo FHS: {oracle_reduction_pct:.2f}%")
 
-    if n_flagged == 0:
-        return None
+def measure_stratified_fhs_speedup(
+    X_clean: np.ndarray,
+    flagged_idx: np.ndarray,
+    unflagged_idx: np.ndarray,
+    t_mlp_total_sec: float,
+    k_sample: int = 40,
+    rng: Optional[np.random.Generator] = None,
+    n_bootstrap: int = 1000,
+    fhs_full_audit: bool = False,
+) -> Dict[str, Any]:
+    """
+    Benchmark Estratificado de Eficiência Computacional via Amostragem Dupla Independente.
 
-    # Amostragem Dupla Independente de Custo do Oráculo FHS
-    k1 = min(fhs_calibration_sample, n_flagged) if not fhs_full_audit else n_flagged
+    Resolve a falha metodológica de latência uniforme do Oráculo FHS:
+      1. Separação de Populações Disjuntas:
+         - Flagged (Crítica): Amostras enviadas para o FHS (fechamento de gap /
+           fluxo de Berry concentrado que acionam refinamento N=60 -> N=120).
+         - Unflagged (Trivial): Amostras no bulk onde a malha grosseira N=60 converge.
+      2. Amostragem Estocástica Estratificada:
+         - Sorteio determinístico sem reposição de k amostras independentes por estrato.
+      3. Medição Independente de Latência com precisão de nanossegundos (time.perf_counter):
+         - t_fhs_flagged (média e desvio padrão em segundos)
+         - t_fhs_unflagged (média e desvio padrão em segundos)
+      4. Cálculo do Speedup Despoluído e Ponderado:
+         - T_pure_fhs = (N_flagged * t_fhs_flagged) + (N_unflagged * t_fhs_unflagged)
+         - T_hybrid = T_mlp_total + (N_flagged * t_fhs_flagged)
+         - Speedup = T_pure_fhs / T_hybrid
+      5. Incerteza Estatística via Bootstrap (IC 95% bicaudal).
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    n_total = len(X_clean)
+    n_flagged = len(flagged_idx)
+    n_unflagged = len(unflagged_idx)
+
+    M_clean = X_clean[:, 0]
+    p2_clean = X_clean[:, 1]
+    p3_clean = X_clean[:, 2]
+    p4_clean = X_clean[:, 3]
+
+    # ── 1. Amostragem e Cronometragem da População Flagged (Crítica) ──
+    k1 = min(k_sample, n_flagged) if not fhs_full_audit else n_flagged
     sample_flagged_idx = rng.choice(flagged_idx, size=k1, replace=False) if not fhs_full_audit else flagged_idx
 
-    t0 = time.perf_counter()
-    fhs_flagged_labels = []
+    latencies_flagged: List[float] = []
+    fhs_flagged_labels: List[Optional[int]] = []
+
     for i in sample_flagged_idx:
-        c = compute_chern_rigorous(float(Ko[i]), float(h[i]), float(eps2[i]), float(eps3[i]), N_init=60, n_occ=3)
-        fhs_flagged_labels.append(c)
-    t_fhs_flagged_sample_total = time.perf_counter() - t0
-    t_fhs_flagged_ms = (t_fhs_flagged_sample_total / len(sample_flagged_idx)) * 1000.0 if len(sample_flagged_idx) > 0 else 0.0
-
-    if n_unflagged > 0:
-        k2 = min(fhs_calibration_sample, n_unflagged)
-        sample_unflagged_idx = rng.choice(unflagged_idx, size=k2, replace=False)
         t0 = time.perf_counter()
-        fhs_unflagged_labels = []
+        c = compute_chern_rigorous(
+            float(M_clean[i]), float(p2_clean[i]), float(p3_clean[i]), float(p4_clean[i]), N_init=60, n_occ=3
+        )
+        dt = time.perf_counter() - t0
+        latencies_flagged.append(dt)
+        fhs_flagged_labels.append(c)
+
+    arr_lat_flagged = np.array(latencies_flagged, dtype=np.float64)
+    t_fhs_flagged_mean_s = float(np.mean(arr_lat_flagged))
+    t_fhs_flagged_std_s = float(np.std(arr_lat_flagged, ddof=1)) if len(arr_lat_flagged) > 1 else 0.0
+
+    # ── 2. Amostragem e Cronometragem da População Unflagged (Trivial / Segura) ──
+    if n_unflagged > 0:
+        k2 = min(k_sample, n_unflagged) if not fhs_full_audit else n_unflagged
+        sample_unflagged_idx = rng.choice(unflagged_idx, size=k2, replace=False) if not fhs_full_audit else unflagged_idx
+
+        latencies_unflagged: List[float] = []
+        fhs_unflagged_labels: List[Optional[int]] = []
+
         for i in sample_unflagged_idx:
-            c = compute_chern_rigorous(float(Ko[i]), float(h[i]), float(eps2[i]), float(eps3[i]), N_init=60, n_occ=3)
+            t0 = time.perf_counter()
+            c = compute_chern_rigorous(
+                float(M_clean[i]), float(p2_clean[i]), float(p3_clean[i]), float(p4_clean[i]), N_init=60, n_occ=3
+            )
+            dt = time.perf_counter() - t0
+            latencies_unflagged.append(dt)
             fhs_unflagged_labels.append(c)
-        t_fhs_unflagged_sample_total = time.perf_counter() - t0
-        t_fhs_unflagged_ms = (t_fhs_unflagged_sample_total / len(sample_unflagged_idx)) * 1000.0
+
+        arr_lat_unflagged = np.array(latencies_unflagged, dtype=np.float64)
+        t_fhs_unflagged_mean_s = float(np.mean(arr_lat_unflagged))
+        t_fhs_unflagged_std_s = float(np.std(arr_lat_unflagged, ddof=1)) if len(arr_lat_unflagged) > 1 else 0.0
     else:
-        t_fhs_unflagged_ms = t_fhs_flagged_ms
+        arr_lat_unflagged = arr_lat_flagged
+        t_fhs_unflagged_mean_s = t_fhs_flagged_mean_s
+        t_fhs_unflagged_std_s = t_fhs_flagged_std_s
 
-    t_fhs_audit_total_sec = (n_flagged * t_fhs_flagged_ms) / 1000.0
-    t_pure_fhs_total_sec = (n_flagged * t_fhs_flagged_ms + n_unflagged * t_fhs_unflagged_ms) / 1000.0
-    t_hybrid_total_sec = t_mlp_total + t_fhs_audit_total_sec
-    speedup = t_pure_fhs_total_sec / t_hybrid_total_sec if t_hybrid_total_sec > 0 else float("inf")
+    latency_ratio = t_fhs_flagged_mean_s / t_fhs_unflagged_mean_s if t_fhs_unflagged_mean_s > 0 else 1.0
 
-    frac_nontrivial_in_sample = float(np.mean([c is not None and c != 0 for c in fhs_flagged_labels]))
+    # ── 3. Projeção Despoluída de Custos Totais e Speedup Realista ──
+    t_fhs_audit_flagged_total_s = n_flagged * t_fhs_flagged_mean_s
+    t_fhs_unflagged_pure_total_s = n_unflagged * t_fhs_unflagged_mean_s
+    t_pure_fhs_total_s = t_fhs_audit_flagged_total_s + t_fhs_unflagged_pure_total_s
+    t_hybrid_total_s = t_mlp_total_sec + t_fhs_audit_flagged_total_s
+    speedup = t_pure_fhs_total_s / t_hybrid_total_s if t_hybrid_total_s > 0 else float("inf")
 
-    print(f" Custo FHS Puro Estimado ({n_eval:,} pts): {t_pure_fhs_total_sec:.2f} s ({t_pure_fhs_total_sec / 60:.1f} min)")
-    print(f" Custo Híbrido Medido: {t_hybrid_total_sec:.2f} s ({t_hybrid_total_sec / 60:.1f} min)")
-    print(f" Speedup de Parede Medido: {speedup:.2f}x")
-    print(f" Fração de Fases Cn!=0 Confirmadas na Amostra Sinalizada: {frac_nontrivial_in_sample:.2%}")
+    # ── 4. Incerteza Estatística via Bootstrap Não-Paramétrico (IC 95%) ──
+    boot_speedups = []
+    boot_ratios = []
+    for _ in range(n_bootstrap):
+        b_f = rng.choice(arr_lat_flagged, size=len(arr_lat_flagged), replace=True)
+        b_u = rng.choice(arr_lat_unflagged, size=len(arr_lat_unflagged), replace=True)
+        m_f = float(np.mean(b_f))
+        m_u = float(np.mean(b_u))
+        b_pure = (n_flagged * m_f) + (n_unflagged * m_u)
+        b_hyb = t_mlp_total_sec + (n_flagged * m_f)
+        boot_speedups.append(b_pure / b_hyb if b_hyb > 0 else 0.0)
+        boot_ratios.append(m_f / m_u if m_u > 0 else 1.0)
+
+    ci_speedup = (float(np.percentile(boot_speedups, 2.5)), float(np.percentile(boot_speedups, 97.5)))
+    ci_ratio = (float(np.percentile(boot_ratios, 2.5)), float(np.percentile(boot_ratios, 97.5)))
+
+    frac_nontrivial_in_flagged = float(np.mean([c is not None and c != 0 for c in fhs_flagged_labels]))
+
+    # ── 5. Relatório Formatado de Auditoria HPC ──
+    print(f"\n{'=' * 86}")
+    print(" BENCHMARK ESTRATIFICADO DE EFICIÊNCIA COMPUTACIONAL (AMOSTRAGEM DUPLA HPC)")
+    print(f"{'=' * 86}")
+    print(f" Lote Total Avaliado:                          {n_total:,} pontos")
+    print(f" População Flagged (Encaminhada ao Oráculo):   {n_flagged:,} pontos ({n_flagged / n_total:.2%})")
+    print(f" População Unflagged (Filtrada pela MLP):      {n_unflagged:,} pontos ({n_unflagged / n_total:.2%})")
+    print(f" ----------------------------------------------------------------------------------")
+    print(f" [AMOSTRAGEM DUPLA INDEPENDENTE DE LATÊNCIA (k_flagged={k1}, k_unflagged={k2 if n_unflagged > 0 else 0})]")
+    print(f" • Latência FHS Flagged (t_fhs_flagged):         {t_fhs_flagged_mean_s * 1000:.3f} ± {t_fhs_flagged_std_s * 1000:.3f} ms/pt")
+    print(f" • Latência FHS Unflagged (t_fhs_unflagged):     {t_fhs_unflagged_mean_s * 1000:.3f} ± {t_fhs_unflagged_std_s * 1000:.3f} ms/pt")
+    print(f" • Razão de Latência (Flagged / Unflagged):      {latency_ratio:.2f}x (IC 95%: [{ci_ratio[0]:.2f}x, {ci_ratio[1]:.2f}x])")
+    print(f" ----------------------------------------------------------------------------------")
+    print(f" [CUSTOS DE TEMPO DE PAREDE PROJETADOS (Wall-Clock Time)]")
+    print(f" • Tempo Forward Pass MLP Total:               {t_mlp_total_sec * 1000:.2f} ms ({t_mlp_total_sec / n_total * 1000:.6f} ms/pt)")
+    print(f" • Custo Oráculo FHS Puro (T_pure_fhs):         {t_pure_fhs_total_s:.2f} s ({t_pure_fhs_total_s / 60:.2f} min)")
+    print(f"     -> Parcela Flagged ({n_flagged:,} pts):           {t_fhs_audit_flagged_total_s:.2f} s ({t_fhs_audit_flagged_total_s / t_pure_fhs_total_s:.1%})")
+    print(f"     -> Parcela Unflagged ({n_unflagged:,} pts):       {t_fhs_unflagged_pure_total_s:.2f} s ({t_fhs_unflagged_pure_total_s / t_pure_fhs_total_s:.1%})")
+    print(f" • Custo Pipeline Híbrido (T_hybrid):           {t_hybrid_total_s:.2f} s ({t_hybrid_total_s / 60:.2f} min)")
+    print(f" ----------------------------------------------------------------------------------")
+    print(f" [MÉTRICAS FINAIS DE GANHO DE DESEMPENHO]")
+    print(f" • Redução de Chamadas ao Oráculo:             {(1.0 - n_flagged / n_total) * 100.0:.2f}%")
+    print(f" • Speedup de Parede Medido (Despoluído):      {speedup:.2f}x (IC 95%: [{ci_speedup[0]:.2f}x, {ci_speedup[1]:.2f}x])")
+    print(f" • Confirmação de Fases Cn!=0 na Amostra:       {frac_nontrivial_in_flagged:.2%}")
+    print(f"{'=' * 86}\n")
 
     return {
-        "n_eval": n_eval,
+        "n_eval": n_total,
         "n_flagged": n_flagged,
         "n_unflagged": n_unflagged,
-        "oracle_reduction_pct": oracle_reduction_pct,
+        "oracle_reduction_pct": (1.0 - n_flagged / n_total) * 100.0,
+        "t_fhs_flagged_ms": t_fhs_flagged_mean_s * 1000.0,
+        "t_fhs_unflagged_ms": t_fhs_unflagged_mean_s * 1000.0,
+        "latency_ratio": latency_ratio,
+        "latency_ratio_ci95": ci_ratio,
         "speedup_measured": speedup,
-        "t_mlp_total_s": t_mlp_total,
-        "t_hybrid_total_s": t_hybrid_total_sec,
-        "t_pure_fhs_total_s": t_pure_fhs_total_sec,
-        "adv_n_ood": n_adv_ood,
+        "speedup_ci95": ci_speedup,
+        "t_mlp_total_s": t_mlp_total_sec,
+        "t_hybrid_total_s": t_hybrid_total_s,
+        "t_pure_fhs_total_s": t_pure_fhs_total_s,
+        "frac_nontrivial_in_sample": frac_nontrivial_in_flagged,
     }
+
+
+def empirical_hybrid_pipeline(
+    model: nn.Module,
+    scaler: StandardScaler,
+    trivial_idx: int,
+    threshold: float,
+    X_train_scaled: np.ndarray,
+    n_eval: int = 100_000,
+    fhs_calibration_sample: int = 40,
+    fhs_full_audit: bool = False,
+    maha_percentile: float = 99.5,
+    seed: int = 7,
+) -> Optional[Dict[str, Any]]:
+    """
+    Avaliação empírica do pipeline híbrido (MLP como filtro de triagem + Oráculo FHS
+    como auditor de alta fidelidade) em 10^5 pontos reais amostrados no espaço de parâmetros.
+    """
+    rng = np.random.default_rng(seed)
+    device = next(model.parameters()).device
+    model.eval()
+
+    print(f"\n{'=' * 86}")
+    print(" PIPELINE HÍBRIDO — AVALIAÇÃO EMPÍRICA EM 10^5 PONTOS REAIS COM GUARDA OOD")
+    print(f"{'=' * 86}")
+
+    guard = TopoDomainGuard(
+        bounds=_BOUNDS,
+        scaler=scaler,
+        X_train_scaled=X_train_scaled,
+        maha_percentile=maha_percentile,
+        epsilon=1e-6,
+    )
+
+    # ── Experimento A: Robustez Adversarial OOD (BBox + Covariate Shift no BBox) ──
+    n_adv = 10_000
+    n_adv_in_bbox_shift = 5_000
+    n_adv_out_bbox = 5_000
+
+    # 1. Pontos fora do Bounding Box físico
+    features_out = []
+    for feat in FEATURES:
+        lo, hi = _BOUNDS[feat]
+        span = hi - lo
+        side = rng.choice([0, 1], size=n_adv_out_bbox)
+        val_out_low = rng.uniform(lo - 0.25 * span, lo, size=n_adv_out_bbox)
+        val_out_high = rng.uniform(hi, hi + 0.25 * span, size=n_adv_out_bbox)
+        features_out.append(np.where(side == 0, val_out_low, val_out_high))
+    X_adv_out = np.stack(features_out, axis=1).astype(np.float32)
+
+    # 2. Pontos DENTRO do Bounding Box, mas com Covariate Shift / correlação anômala não vista
+    #    (amostrados nos vértices e cantos do hipercubo onde a densidade espectral é anômala)
+    M_lo, M_hi = _BOUNDS["M"]
+    p_lo, p_hi = -1.0, 1.0
+    corner_M = rng.choice([M_lo + 0.01, M_hi - 0.01], size=n_adv_in_bbox_shift)
+    corner_p2 = rng.choice([p_lo + 0.01, p_hi - 0.01], size=n_adv_in_bbox_shift)
+    corner_p3 = rng.choice([p_lo + 0.01, p_hi - 0.01], size=n_adv_in_bbox_shift)
+    corner_p4 = rng.choice([p_lo + 0.01, p_hi - 0.01], size=n_adv_in_bbox_shift)
+    noise = rng.normal(0, 0.02, size=(n_adv_in_bbox_shift, 4))
+    X_adv_in = np.stack([corner_M, corner_p2, corner_p3, corner_p4], axis=1).astype(np.float32) + noise
+    # Garante que X_adv_in permaneça estritamente dentro do BBox para testar Mahalanobis
+    for j, feat in enumerate(FEATURES):
+        lo, hi = _BOUNDS[feat]
+        X_adv_in[:, j] = np.clip(X_adv_in[:, j], lo + 1e-4, hi - 1e-4)
+
+    X_adv = np.vstack([X_adv_out, X_adv_in])
+    rng.shuffle(X_adv)
+
+    gate_adv = guard.check(X_adv)
+    n_adv_ood = int((~gate_adv["trusted"]).sum())
+    n_adv_bbox = int((~gate_adv["in_bbox"]).sum())
+    n_adv_maha = int((~gate_adv["in_density"]).sum())
+
+    print(f"\n [EXPERIMENTO A: Robustez OOD — Lote Adversarial 10k pts]")
+    print(f" Pontos OOD Interceptados: {n_adv_ood:,} ({n_adv_ood / n_adv:.1%})")
+    print(f"   -> Barrados por Limites Físicos (BBox): {n_adv_bbox:,}")
+    print(f"   -> Barrados por Densidade Espectral (Mahalanobis p{maha_percentile:g}): {n_adv_maha:,}")
+
+    # ── Experimento B: Eficiência Operacional em Lote Limpo (10^5 Pontos) ──
+    features_list_clean = []
+    for feat in FEATURES:
+        lo, hi = _BOUNDS[feat]
+        features_list_clean.append(rng.uniform(lo, hi, n_eval))
+
+    X_clean = np.stack(features_list_clean, axis=1).astype(np.float32)
+    X_clean_s = scaler.transform(X_clean).astype(np.float32)
+
+    X_tensor = torch.from_numpy(X_clean_s).to(device)
+    with torch.no_grad():
+        t0 = time.perf_counter()
+        logits = model(X_tensor)
+        probs = torch.softmax(logits, dim=-1)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t_mlp_total = time.perf_counter() - t0
+
+    probs_nt = (1.0 - probs[:, trivial_idx]).cpu().numpy()
+    routing_clean = guard.route_inference(X_clean, probs_nt, threshold=threshold)
+    flagged_mask_clean = routing_clean["flagged_for_oracle"]
+
+    flagged_idx = np.where(flagged_mask_clean)[0]
+    unflagged_idx = np.where(~flagged_mask_clean)[0]
+
+    if len(flagged_idx) == 0:
+        return None
+
+    # Benchmark Estratificado com Amostragem Dupla Independente
+    strat_report = measure_stratified_fhs_speedup(
+        X_clean=X_clean,
+        flagged_idx=flagged_idx,
+        unflagged_idx=unflagged_idx,
+        t_mlp_total_sec=t_mlp_total,
+        k_sample=fhs_calibration_sample,
+        rng=rng,
+        n_bootstrap=1000,
+        fhs_full_audit=fhs_full_audit,
+    )
+    strat_report["adv_n_ood"] = n_adv_ood
+    return strat_report
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1158,12 +1474,13 @@ def main() -> None:
     )
 
     # 8. SIMULAÇÃO DO PIPELINE HÍBRIDO EM PRODUÇÃO (10^5 PONTOS)
+    # Importante: X_train_scaled fornecido é EXCLUSIVAMENTE o conjunto de treinamento da semente de produção
     hybrid_report = empirical_hybrid_pipeline(
         model=prod_mlp_candidate["model"],
         scaler=prod_mlp_candidate["scaler"],
         trivial_idx=trivial_idx,
         threshold=prod_mlp_candidate["threshold"],
-        X_train_scaled=holdout_results["X_holdout_scaled"],
+        X_train_scaled=prod_mlp_candidate["X_train_scaled"],
         n_eval=100_000,
         fhs_calibration_sample=40,
         fhs_full_audit=False,
@@ -1192,3 +1509,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
