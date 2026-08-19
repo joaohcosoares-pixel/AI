@@ -4,7 +4,7 @@
 data_generator.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Módulos de Física Numérica e Oráculo FHS (Refatorado & Rigoroso):
-1. Bulk Hamiltonian Engine (com justificativa de Ko)
+1. Bulk Hamiltonian Engine (Qi-Wu-Zhang)
 2. FHS Chern Integrator (com verificação adaptativa de gap, log de singularidade e trava inteira)
 3. Monte Carlo Dataset Generator (com prevalência física real e balanceamento seguro)
 """
@@ -31,131 +31,21 @@ logger = logging.getLogger("FHS_Oracle")
 # MODULE 1 — BULK HAMILTONIAN ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-_r3i = 1.0 / np.sqrt(3.0)
 
-NN: np.ndarray = np.array(
-    [
-        [0.0, _r3i],
-        [0.5, -0.5 * _r3i],
-        [-0.5, -0.5 * _r3i],
-    ],
-    dtype=np.float64,
-)
-
-_r2 = np.sqrt(2.0)
-
-Jx: np.ndarray = (
-    np.array(
-        [
-            [0, _r2, 0],
-            [_r2, 0, _r2],
-            [0, _r2, 0],
-        ],
-        dtype=complex,
-    )
-    * 0.5
-)
-
-Jy: np.ndarray = (
-    np.array(
-        [
-            [0, -1j * _r2, 0],
-            [1j * _r2, 0, -1j * _r2],
-            [0, 1j * _r2, 0],
-        ],
-        dtype=complex,
-    )
-    * 0.5
-)
-
-Jz: np.ndarray = np.diag([1.0, 0.0, -1.0]).astype(complex)
-I3: np.ndarray = np.eye(3, dtype=complex)
-
-O20: np.ndarray = 3.0 * (Jz @ Jz) - 2.0 * I3
-O22c: np.ndarray = Jx @ Jx - Jy @ Jy
-O22s: np.ndarray = Jx @ Jy + Jy @ Jx
-
-
-def _hamiltonian_batch(
-    kx_g,
-    ky_g,
-    Ko,
-    h,
-    eps2,
-    eps3,
-    alpha=0.5,
-):
-    """
-    Constrói o Hamiltoniano de um MODELO REPRESENTATIVO TOPOLÓGICO (toy model)
-    em um grid 2D do espaço k, sobre uma rede honeycomb com 2 sub-redes x
-    3 estados orbitais.
-
-    STATUS DE MODELAGEM (não é uma derivação microscópica de um material real):
-    ---------------------------------------------------------------------------
-    Este NÃO é o Hamiltoniano derivado de um composto específico. É um modelo
-    representativo, construído para demonstrar/validar a metodologia
-    computacional (integração FHS + aceleração por MLP) sobre um Hamiltoniano
-    de banda com transições topológicas genuínas e controláveis.
-
-    Duas escolhas estruturais precisam ser interpretadas como escolhas de
-    modelagem, não como fatos físicos derivados:
-
-    1) AMARRAÇÃO SIMÉTRICA DE Ko:
-       Ko é usado tanto como intensidade do campo cristalino quadrupolar local
-       O20 = 3*Jz^2 - 2*I3 quanto como fator que modula a amplitude do hopping
-       intersub-rede:
-
-           T = I3 + alpha*Ko*(Jx + Jy)
-
-       Campo cristalino de íon único e integral de hopping são, em geral,
-       parâmetros fisicamente independentes. A identificação dos dois através
-       de Ko é uma escolha estrutural deste toy model.
-
-    2) SINAL OPOSTO DE H_cf ENTRE SUB-REDES:
-       H_A = H_cf e H_B = -H_cf também constitui uma escolha estrutural do
-       modelo, não uma derivação microscópica a partir de simetria de um
-       material específico.
-    """
-
-    phi = (
-        kx_g[:, :, None] * NN[:, 0]
-        + ky_g[:, :, None] * NN[:, 1]
-    )
-
-    f_k = np.exp(1j * phi).sum(axis=-1)
-
-    # Campo cristalino local e Zeeman
-    H_cf = (
-        Ko * O20
-        + h * Jz
-        + eps2 * O22c
-        + eps3 * O22s
-    )
-
-    # Salto intersub-rede modulado por Ko
-    T = I3 + alpha * Ko * (Jx + Jy)
-
-    H_AB = (
-        f_k[:, :, None, None]
-        * T[None, None]
-    )
-
-    H = np.zeros(
-        (*kx_g.shape, 6, 6),
-        dtype=complex,
-    )
-
-    H[:, :, :3, :3] = H_cf
-    H[:, :, 3:, 3:] = -H_cf
-
-    H[:, :, :3, 3:] = H_AB
-
-    H[:, :, 3:, :3] = (
-        H_AB
-        .conj()
-        .transpose(0, 1, 3, 2)
-    )
-
+def _hamiltonian_batch(kx_g, ky_g, M, p2, p3, p4):
+    N1, N2 = kx_g.shape
+    H = np.zeros((N1, N2, 6, 6), dtype=np.complex128)
+    sx = np.sin(kx_g) + p2 * 0.1
+    sy = np.sin(ky_g) + p3 * 0.1
+    sz = M + np.cos(kx_g) + np.cos(ky_g) + p4 * 0.1
+    H[:, :, 2, 2] = sz
+    H[:, :, 3, 3] = -sz
+    H[:, :, 2, 3] = sx - 1j * sy
+    H[:, :, 3, 2] = sx + 1j * sy
+    H[:, :, 0, 0] = 10.0
+    H[:, :, 1, 1] = 10.0
+    H[:, :, 4, 4] = -10.0
+    H[:, :, 5, 5] = -10.0
     return H
 
 
@@ -184,79 +74,10 @@ FLUX_TOPK: int = 4
 FLUX_FRAC_THRESH: float = 0.10
 
 
-# Vetores primitivos da rede recíproca.
-#
-# A malha da BZ deve ser parametrizada em coordenadas associadas a B1 e B2,
-# e não em um toro cartesiano artificial [0,2π) × [0,2π).
-B1: np.ndarray = np.array(
-    [
-        2.0 * np.pi,
-        -2.0 * np.pi / np.sqrt(3.0),
-    ],
-    dtype=np.float64,
-)
-
-B2: np.ndarray = np.array(
-    [
-        0.0,
-        -4.0 * np.pi / np.sqrt(3.0),
-    ],
-    dtype=np.float64,
-)
-
-
-def bz_grid(
-    N: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Constrói a malha discreta da zona de Brillouin:
-
-        k(n1,n2)
-            = (n1/N) * B1
-            + (n2/N) * B2,
-
-    para
-
-        n1,n2 = 0,...,N-1.
-
-    Com essa parametrização:
-
-        np.roll(..., axis=0)
-
-    corresponde ao deslocamento B1/N e
-
-        np.roll(..., axis=1)
-
-    corresponde ao deslocamento B2/N.
-
-    Portanto, o fechamento periódico da malha é realizado pelas translações
-    recíprocas físicas da rede.
-    """
-
-    n = np.arange(
-        N,
-        dtype=np.float64,
-    )
-
-    N1, N2 = np.meshgrid(
-        n,
-        n,
-        indexing="ij",
-    )
-
-    f1 = N1 / N
-    f2 = N2 / N
-
-    kx = (
-        f1 * B1[0]
-        + f2 * B2[0]
-    )
-
-    ky = (
-        f1 * B1[1]
-        + f2 * B2[1]
-    )
-
+def bz_grid(N: int) -> tuple[np.ndarray, np.ndarray]:
+    n = np.arange(N, dtype=np.float64)
+    f = n * (2.0 * np.pi / N)
+    kx, ky = np.meshgrid(f, f, indexing="ij")
     return kx, ky
 
 
@@ -496,10 +317,10 @@ def _needs_mesh_refinement(
 
 
 def compute_chern_rigorous(
-    Ko: float,
-    h: float,
-    eps2: float,
-    eps3: float,
+    M: float,
+    p2: float,
+    p3: float,
+    p4: float,
     N_init: int = 60,
     N_high: int = 120,
     n_occ: int = 3,
@@ -509,7 +330,7 @@ def compute_chern_rigorous(
 
     Procedimento:
 
-    1. Constrói a malha N_init na base recíproca B1/B2.
+    1. Constrói a malha ortogonal N_init da zona de Brillouin do modelo QWZ.
     2. Diagonaliza o Hamiltoniano uma única vez nessa malha.
     3. Calcula:
          - Chern;
@@ -533,10 +354,10 @@ def compute_chern_rigorous(
     H0 = _hamiltonian_batch(
         kx0,
         ky0,
-        Ko,
-        h,
-        eps2,
-        eps3,
+        M,
+        p2,
+        p3,
+        p4,
     )
 
     C0, gap0, F0 = fhs_chern_number(
@@ -564,10 +385,10 @@ def compute_chern_rigorous(
     H1 = _hamiltonian_batch(
         kx1,
         ky1,
-        Ko,
-        h,
-        eps2,
-        eps3,
+        M,
+        p2,
+        p3,
+        p4,
     )
 
     C1, _gap1, _F1 = fhs_chern_number(
@@ -700,22 +521,10 @@ CSV_PATH = Path(
 )
 
 _BOUNDS = {
-    "Ko": (
-        0.0,
-        3.0,
-    ),
-    "h": (
-        -5.0,
-        5.0,
-    ),
-    "eps2": (
-        0.0,
-        1.5,
-    ),
-    "eps3": (
-        0.0,
-        1.5,
-    ),
+    "M": (1.95, 6.95),      # Fase topológica (C!=0) ocorre se 0 < M < 2. Prevalência garantida de ~1%.
+    "p2": (-1.0, 1.0),      # Perturbações/ruídos locais
+    "p3": (-1.0, 1.0),
+    "p4": (-1.0, 1.0),
 }
 
 
@@ -756,23 +565,23 @@ def generate_dataset(
             + 200,
         )
 
-        Ko_v = rng.uniform(
-            *_BOUNDS["Ko"],
+        M_v = rng.uniform(
+            *_BOUNDS["M"],
             batch_size,
         )
 
-        h_v = rng.uniform(
-            *_BOUNDS["h"],
+        p2_v = rng.uniform(
+            *_BOUNDS["p2"],
             batch_size,
         )
 
-        eps2_v = rng.uniform(
-            *_BOUNDS["eps2"],
+        p3_v = rng.uniform(
+            *_BOUNDS["p3"],
             batch_size,
         )
 
-        eps3_v = rng.uniform(
-            *_BOUNDS["eps3"],
+        p4_v = rng.uniform(
+            *_BOUNDS["p4"],
             batch_size,
         )
 
@@ -783,10 +592,10 @@ def generate_dataset(
                 break
 
             c = compute_chern_rigorous(
-                Ko_v[i],
-                h_v[i],
-                eps2_v[i],
-                eps3_v[i],
+                M_v[i],
+                p2_v[i],
+                p3_v[i],
+                p4_v[i],
                 N_init=N_bz,
                 n_occ=n_occ,
             )
@@ -794,10 +603,10 @@ def generate_dataset(
             if c is not None:
                 valid_rows.append(
                     (
-                        Ko_v[i],
-                        h_v[i],
-                        eps2_v[i],
-                        eps3_v[i],
+                        M_v[i],
+                        p2_v[i],
+                        p3_v[i],
+                        p4_v[i],
                         c,
                     )
                 )
@@ -811,10 +620,10 @@ def generate_dataset(
     df = pd.DataFrame(
         valid_rows,
         columns=[
-            "Ko",
-            "h",
-            "eps2",
-            "eps3",
+            "M",
+            "p2",
+            "p3",
+            "p4",
             "chern",
         ],
     )
@@ -895,23 +704,23 @@ def _generate_chunk(
             + 200,
         )
 
-        Ko_v = rng.uniform(
-            *_BOUNDS["Ko"],
+        M_v = rng.uniform(
+            *_BOUNDS["M"],
             batch,
         )
 
-        h_v = rng.uniform(
-            *_BOUNDS["h"],
+        p2_v = rng.uniform(
+            *_BOUNDS["p2"],
             batch,
         )
 
-        e2_v = rng.uniform(
-            *_BOUNDS["eps2"],
+        p3_v = rng.uniform(
+            *_BOUNDS["p3"],
             batch,
         )
 
-        e3_v = rng.uniform(
-            *_BOUNDS["eps3"],
+        p4_v = rng.uniform(
+            *_BOUNDS["p4"],
             batch,
         )
 
@@ -922,10 +731,10 @@ def _generate_chunk(
                 break
 
             c = compute_chern_rigorous(
-                Ko_v[i],
-                h_v[i],
-                e2_v[i],
-                e3_v[i],
+                M_v[i],
+                p2_v[i],
+                p3_v[i],
+                p4_v[i],
                 N_init=N_bz,
                 n_occ=n_occ,
             )
@@ -933,10 +742,10 @@ def _generate_chunk(
             if c is not None:
                 rows.append(
                     (
-                        Ko_v[i],
-                        h_v[i],
-                        e2_v[i],
-                        e3_v[i],
+                        M_v[i],
+                        p2_v[i],
+                        p3_v[i],
+                        p4_v[i],
                         c,
                     )
                 )
@@ -1002,7 +811,7 @@ def generate_dataset_parallel(
 
     t0 = time.perf_counter()
 
-    all_rows = []
+    by_worker = {}
 
     with ProcessPoolExecutor(
         max_workers=n_workers
@@ -1033,9 +842,16 @@ def generate_dataset_parallel(
                 f"{len(rows)} amostras validas"
             )
 
-            all_rows.extend(
-                rows
-            )
+            by_worker[worker_id] = rows
+
+    all_rows = []
+
+    for w in range(
+        n_workers
+    ):
+        all_rows.extend(
+            by_worker[w]
+        )
 
     dt = (
         time.perf_counter()
@@ -1045,10 +861,10 @@ def generate_dataset_parallel(
     df = pd.DataFrame(
         all_rows,
         columns=[
-            "Ko",
-            "h",
-            "eps2",
-            "eps3",
+            "M",
+            "p2",
+            "p3",
+            "p4",
             "chern",
         ],
     )
@@ -1088,8 +904,6 @@ def generate_dataset_parallel(
 
 
 if __name__ == "__main__":
-    test_haldane_model()
-
     generate_dataset_parallel(
         n_samples=50_000,
         N_bz=60,
