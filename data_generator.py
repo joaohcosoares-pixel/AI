@@ -20,21 +20,54 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore")
 
 # Configuração de Logger para auditoria de singularidades e fechamento de gap
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 logger = logging.getLogger("FHS_Oracle")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MODULE 1 — BULK HAMILTONIAN ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
 _r3i = 1.0 / np.sqrt(3.0)
+
 NN: np.ndarray = np.array(
-    [[0.0, _r3i], [0.5, -0.5 * _r3i], [-0.5, -0.5 * _r3i]], dtype=np.float64
+    [
+        [0.0, _r3i],
+        [0.5, -0.5 * _r3i],
+        [-0.5, -0.5 * _r3i],
+    ],
+    dtype=np.float64,
 )
 
 _r2 = np.sqrt(2.0)
-Jx: np.ndarray = (np.array([[0, _r2, 0], [_r2, 0, _r2], [0, _r2, 0]], dtype=complex) * 0.5)
-Jy: np.ndarray = (np.array([[0, -1j * _r2, 0], [1j * _r2, 0, -1j * _r2], [0, 1j * _r2, 0]], dtype=complex) * 0.5)
+
+Jx: np.ndarray = (
+    np.array(
+        [
+            [0, _r2, 0],
+            [_r2, 0, _r2],
+            [0, _r2, 0],
+        ],
+        dtype=complex,
+    )
+    * 0.5
+)
+
+Jy: np.ndarray = (
+    np.array(
+        [
+            [0, -1j * _r2, 0],
+            [1j * _r2, 0, -1j * _r2],
+            [0, 1j * _r2, 0],
+        ],
+        dtype=complex,
+    )
+    * 0.5
+)
+
 Jz: np.ndarray = np.diag([1.0, 0.0, -1.0]).astype(complex)
 I3: np.ndarray = np.eye(3, dtype=complex)
 
@@ -42,293 +75,1024 @@ O20: np.ndarray = 3.0 * (Jz @ Jz) - 2.0 * I3
 O22c: np.ndarray = Jx @ Jx - Jy @ Jy
 O22s: np.ndarray = Jx @ Jy + Jy @ Jx
 
-def _hamiltonian_batch(kx_g, ky_g, Ko, h, eps2, eps3, alpha=0.5):
+
+def _hamiltonian_batch(
+    kx_g,
+    ky_g,
+    Ko,
+    h,
+    eps2,
+    eps3,
+    alpha=0.5,
+):
     """
-    Constrói o Hamiltoniano de um MODELO REPRESENTATIVO TOPOLÓGICO (toy model) em um
-    grid 2D do espaço k, sobre uma rede honeycomb com 2 sub-redes x 3 estados orbitais.
+    Constrói o Hamiltoniano de um MODELO REPRESENTATIVO TOPOLÓGICO (toy model)
+    em um grid 2D do espaço k, sobre uma rede honeycomb com 2 sub-redes x
+    3 estados orbitais.
 
     STATUS DE MODELAGEM (não é uma derivação microscópica de um material real):
-    -----------------------------------------------------------------------
+    ---------------------------------------------------------------------------
     Este NÃO é o Hamiltoniano derivado de um composto específico. É um modelo
-    representativo, construído para demonstrar/validar a metodologia computacional
-    (integração FHS + aceleração por MLP) sobre um Hamiltoniano de banda com
-    transições topológicas genuínas e controláveis. Duas escolhas estruturais
-    precisam ser lidas como isso -- escolhas de modelagem, não fatos físicos
-    derivados -- e não como propriedades de um material real sem citação/derivação
-    microscópica adicional:
+    representativo, construído para demonstrar/validar a metodologia
+    computacional (integração FHS + aceleração por MLP) sobre um Hamiltoniano
+    de banda com transições topológicas genuínas e controláveis.
 
-    1) AMARRAÇÃO SIMÉTRICA DE Ko (papel duplo, por construção):
+    Duas escolhas estruturais precisam ser interpretadas como escolhas de
+    modelagem, não como fatos físicos derivados:
+
+    1) AMARRAÇÃO SIMÉTRICA DE Ko:
        Ko é usado tanto como intensidade do campo cristalino quadrupolar local
-       O20 = 3*Jz^2 - 2*I3 (termo intra-sub-rede, em H_cf) quanto como fator que
-       modula a amplitude de hopping intersub-rede via T = I3 + alpha*Ko*(Jx+Jy)
-       (termo inter-sub-rede, em H_AB). Amarrar os dois ao mesmo parâmetro é uma
-       escolha deliberada para obter transições topológicas controláveis por um
-       único parâmetro varrido em 1D/2D (útil para gerar o dataset e visualizar
-       diagramas de fase) -- não uma consequência derivada de um mecanismo
-       microscópico específico (spin-órbita, superexchange, etc.). Campo cristalino
-       de íon único e integral de hopping são, em geral, parâmetros fisicamente
-       independentes; tratá-los como o mesmo grau de liberdade exige, para
-       publicação como resultado físico (não apenas metodológico), uma derivação
-       microscópica explícita ou citação a um modelo estabelecido que já faça essa
-       amarração.
-    2) SINAL OPOSTO DE H_cf ENTRE SUB-REDES (H_B = -H_cf, ver bloco de construção
-       abaixo): também uma escolha estrutural do toy model (lembra o termo de massa
-       de Dirac do modelo de Haldane, com sinais opostos nas duas sub-redes), não
-       derivada aqui a partir de simetria do grupo espacial de um material específico.
+       O20 = 3*Jz^2 - 2*I3 quanto como fator que modula a amplitude do hopping
+       intersub-rede:
+
+           T = I3 + alpha*Ko*(Jx + Jy)
+
+       Campo cristalino de íon único e integral de hopping são, em geral,
+       parâmetros fisicamente independentes. A identificação dos dois através
+       de Ko é uma escolha estrutural deste toy model.
+
+    2) SINAL OPOSTO DE H_cf ENTRE SUB-REDES:
+       H_A = H_cf e H_B = -H_cf também constitui uma escolha estrutural do
+       modelo, não uma derivação microscópica a partir de simetria de um
+       material específico.
     """
-    phi = kx_g[:, :, None] * NN[:, 0] + ky_g[:, :, None] * NN[:, 1]
+
+    phi = (
+        kx_g[:, :, None] * NN[:, 0]
+        + ky_g[:, :, None] * NN[:, 1]
+    )
+
     f_k = np.exp(1j * phi).sum(axis=-1)
-    
+
     # Campo cristalino local e Zeeman
-    H_cf = Ko * O20 + h * Jz + eps2 * O22c + eps3 * O22s
-    
-    # Salto topológico intersub-rede modulado por Ko
+    H_cf = (
+        Ko * O20
+        + h * Jz
+        + eps2 * O22c
+        + eps3 * O22s
+    )
+
+    # Salto intersub-rede modulado por Ko
     T = I3 + alpha * Ko * (Jx + Jy)
-    H_AB = f_k[:, :, None, None] * T[None, None]
-    
-    H = np.zeros((*kx_g.shape, 6, 6), dtype=complex)
+
+    H_AB = (
+        f_k[:, :, None, None]
+        * T[None, None]
+    )
+
+    H = np.zeros(
+        (*kx_g.shape, 6, 6),
+        dtype=complex,
+    )
+
     H[:, :, :3, :3] = H_cf
     H[:, :, 3:, 3:] = -H_cf
+
     H[:, :, :3, 3:] = H_AB
-    H[:, :, 3:, :3] = H_AB.conj().transpose(0, 1, 3, 2)
+
+    H[:, :, 3:, :3] = (
+        H_AB
+        .conj()
+        .transpose(0, 1, 3, 2)
+    )
+
     return H
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# MODULE 2 — MÉTODO FHS RIGOROSO & ORÁCULO DE GAP ADAPTATIVO
+# MODULE 2 — GEOMETRIA DA ZONA DE BRILLOUIN + MÉTODO FHS RIGOROSO
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Constante única de tolerância de gap. Alinhada ao limiar Δmin < 1e-6 declarado no
-# texto do manuscrito (Seção 2.3). Antes desta correção, check_gap_adaptive() usava
-# 1e-5 (default do parâmetro `tol`) enquanto fhs_chern_number() tinha um segundo
-# limiar hardcoded, independente, também em 1e-5 -- dois literais que podiam divergir
-# silenciosamente entre si e do texto. Agora ambos referenciam esta única constante.
 GAP_TOL: float = 1e-6
 
-def check_gap_adaptive(Ko: float, h: float, eps2: float, eps3: float, n_occ: int = 3,
-                       N_init: int = 60, N_high: int = 120, tol: float = GAP_TOL) -> tuple[bool, float]:
-    """
-    Verifica a robustez do hiato espectral (gap) usando resolução adaptativa.
-    Pontos com gap suspeito (perto do limite 'tol') são reavaliados em N_high=120.
-    """
-    # Avaliação primária em N_init
-    k1d = np.linspace(0.0, 2.0 * np.pi, N_init, endpoint=False)
-    kx_g, ky_g = np.meshgrid(k1d, k1d, indexing="ij")
-    H_batch = _hamiltonian_batch(kx_g, ky_g, Ko, h, eps2, eps3)
-    eigvals = np.linalg.eigvalsh(H_batch)
-    
-    gap_min = float(np.min(eigvals[..., n_occ] - eigvals[..., n_occ - 1]))
+# Limiar absoluto de gap.
+#
+# Substitui a janela multiplicativa estreita
+#
+#     GAP_TOL < gap_min < 5*GAP_TOL
+#
+# porque o mínimo verdadeiro pode ocorrer entre pontos da malha grosseira.
+#
+# Calibração registrada na auditoria:
+# apenas 2,75% dos pontos da varredura apresentaram gap_min(N=60) < 0.08.
+REFINE_GAP_ABS: float = 0.08
 
-    if gap_min <= tol:
-        return False, gap_min
 
-    # Reavaliação adaptativa para pontos com gap frágil/suspeito perto da transição
-    if tol < gap_min < 5.0 * tol:
-        k1d_high = np.linspace(0.0, 2.0 * np.pi, N_high, endpoint=False)
-        kx_h, ky_h = np.meshgrid(k1d_high, k1d_high, indexing="ij")
-        H_high = _hamiltonian_batch(kx_h, ky_h, Ko, h, eps2, eps3)
-        eigvals_high = np.linalg.eigvalsh(H_high)
-        gap_min_high = float(np.min(eigvals_high[..., n_occ] - eigvals_high[..., n_occ - 1]))
-        if gap_min_high <= tol:
-            return False, gap_min_high
-        return True, gap_min_high
+# Critério secundário:
+# concentração do fluxo de Berry nas plaquetas de maior |F_tilde|.
+FLUX_TOPK: int = 4
+FLUX_FRAC_THRESH: float = 0.10
 
-    return True, gap_min
 
-def fhs_chern_number(H_batch: np.ndarray, n_occ: int, quant_tol: float = 1e-2,
-                      gap_tol: float = GAP_TOL) -> int | None:
+# Vetores primitivos da rede recíproca.
+#
+# A malha da BZ deve ser parametrizada em coordenadas associadas a B1 e B2,
+# e não em um toro cartesiano artificial [0,2π) × [0,2π).
+B1: np.ndarray = np.array(
+    [
+        2.0 * np.pi,
+        -2.0 * np.pi / np.sqrt(3.0),
+    ],
+    dtype=np.float64,
+)
+
+B2: np.ndarray = np.array(
+    [
+        0.0,
+        -4.0 * np.pi / np.sqrt(3.0),
+    ],
+    dtype=np.float64,
+)
+
+
+def bz_grid(
+    N: int,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Calcula o número de Chern via método Fukui-Hatsugai-Suzuki (FHS) com travas rígidas:
-    1. Supressão de mascaramento silencioso: registra matrizes singulares |det(M)| < 1e-12.
-    2. Validação estrita de inteiro: exige |C_raw - round(C_raw)| < quant_tol.
-    Usa o mesmo GAP_TOL de check_gap_adaptive (ver Módulo 2) -- limiar único, não duplicado.
+    Constrói a malha discreta da zona de Brillouin:
+
+        k(n1,n2)
+            = (n1/N) * B1
+            + (n2/N) * B2,
+
+    para
+
+        n1,n2 = 0,...,N-1.
+
+    Com essa parametrização:
+
+        np.roll(..., axis=0)
+
+    corresponde ao deslocamento B1/N e
+
+        np.roll(..., axis=1)
+
+    corresponde ao deslocamento B2/N.
+
+    Portanto, o fechamento periódico da malha é realizado pelas translações
+    recíprocas físicas da rede.
     """
-    eigvals, psi_all = np.linalg.eigh(H_batch)
-    
-    # Validação preliminar de gap simples na malha fornecida
-    gap_min = np.min(eigvals[..., n_occ] - eigenvalues_occ(eigvals, n_occ))
+
+    n = np.arange(
+        N,
+        dtype=np.float64,
+    )
+
+    N1, N2 = np.meshgrid(
+        n,
+        n,
+        indexing="ij",
+    )
+
+    f1 = N1 / N
+    f2 = N2 / N
+
+    kx = (
+        f1 * B1[0]
+        + f2 * B2[0]
+    )
+
+    ky = (
+        f1 * B1[1]
+        + f2 * B2[1]
+    )
+
+    return kx, ky
+
+
+def fhs_chern_number(
+    H_batch: np.ndarray,
+    n_occ: int,
+    quant_tol: float = 1e-2,
+    gap_tol: float = GAP_TOL,
+    return_diag: bool = False,
+):
+    """
+    Calcula o número de Chern via método Fukui-Hatsugai-Suzuki (FHS).
+
+    Travas implementadas:
+
+    1. Verificação explícita do gap entre a banda ocupada mais alta e a
+       primeira banda desocupada.
+
+    2. Rejeição do ponto quando:
+
+           gap_min <= gap_tol
+
+    3. Detecção de matrizes de overlap praticamente singulares:
+
+           |det(M)| < 1e-12
+
+    4. Validação da quantização inteira:
+
+           |C_raw - round(C_raw)| <= quant_tol
+
+    Se return_diag=True, retorna:
+
+        (chern, gap_min, F_tilde)
+
+    Caso contrário, retorna apenas:
+
+        chern
+
+    ou None caso o ponto não possa receber um rótulo topológico confiável.
+    """
+
+    eigvals, psi_all = np.linalg.eigh(
+        H_batch
+    )
+
+    # Gap direto entre:
+    #   primeira banda não ocupada -> índice n_occ
+    #   última banda ocupada       -> índice n_occ - 1
+    #
+    # Esta forma explícita elimina a dependência inexistente
+    # eigenvalues_occ(...) presente na integração intermediária.
+    gap = (
+        eigvals[..., n_occ]
+        - eigvals[..., n_occ - 1]
+    )
+
+    gap_min = float(
+        np.min(gap)
+    )
+
     if gap_min <= gap_tol:
+        if return_diag:
+            return None, gap_min, None
+
         return None
 
-    psi = psi_all[:, :, :, :n_occ]
+    # Subespaço ocupado.
+    psi = psi_all[
+        :,
+        :,
+        :,
+        :n_occ,
+    ]
 
     singular_detected = False
 
-    def _link(ax: int) -> np.ndarray:
-        nonlocal singular_detected
-        psi_fwd = np.roll(psi, -1, axis=ax)
-        M = np.einsum("...ia,...ib->...ab", psi.conj(), psi_fwd)
-        det_M = np.linalg.det(M)
-        
-        # SUPRESSÃO DE SILENCIAMENTO: matrizes singulares indicam cruzamento de bandas/gap nulo
-        abs_det = np.abs(det_M)
-        if np.any(abs_det < 1e-12):
-            singular_detected = True
-            logger.debug("Singularidade detectada em _link: |det(M)| < 1e-12.")
-            
-        return det_M / (abs_det + 1e-15)
+    def _link(
+        ax: int,
+    ) -> np.ndarray:
+        """
+        Determinante do overlap não-Abeliano entre os subespaços ocupados em
+        pontos vizinhos da malha.
+        """
 
-    U1 = _link(ax=0)
-    U2 = _link(ax=1)
+        nonlocal singular_detected
+
+        psi_fwd = np.roll(
+            psi,
+            -1,
+            axis=ax,
+        )
+
+        M = np.einsum(
+            "...ia,...ib->...ab",
+            psi.conj(),
+            psi_fwd,
+        )
+
+        det_M = np.linalg.det(
+            M
+        )
+
+        abs_det = np.abs(
+            det_M
+        )
+
+        if np.any(
+            abs_det < 1e-12
+        ):
+            singular_detected = True
+
+            logger.debug(
+                "Singularidade detectada em _link: |det(M)| < 1e-12."
+            )
+
+        return (
+            det_M
+            / (abs_det + 1e-15)
+        )
+
+    U1 = _link(
+        ax=0
+    )
+
+    U2 = _link(
+        ax=1
+    )
 
     if singular_detected:
-        # Se houve degenerescência pontual na malha FHS, o invariante U(1) é indefinido
+        if return_diag:
+            return None, gap_min, None
+
         return None
 
-    U_plaquette = U1 * np.roll(U2, -1, axis=0) * np.roll(U1, -1, axis=1).conj() * U2.conj()
-    F_tilde = np.angle(U_plaquette + 1e-10j)
-    
-    C_raw = F_tilde.sum() / (2.0 * np.pi)
-    C_round = np.round(C_raw)
+    U_plaquette = (
+        U1
+        * np.roll(
+            U2,
+            -1,
+            axis=0,
+        )
+        * np.roll(
+            U1,
+            -1,
+            axis=1,
+        ).conj()
+        * U2.conj()
+    )
 
-    # TRAVA DE INTEIRO: A integral dividida por 2pi deve ser um inteiro dentro de tol
-    if abs(C_raw - C_round) > quant_tol:
-        logger.debug(f"Violação de quantização inteira: C_raw={C_raw:.4f}, desvio={abs(C_raw - C_round):.4e}")
+    F_tilde = np.angle(
+        U_plaquette + 1e-10j
+    )
+
+    C_raw = (
+        F_tilde.sum()
+        / (2.0 * np.pi)
+    )
+
+    C_round = np.round(
+        C_raw
+    )
+
+    quant_error = abs(
+        C_raw - C_round
+    )
+
+    if quant_error > quant_tol:
+        logger.debug(
+            "Violação de quantização inteira: "
+            f"C_raw={C_raw:.4f}, "
+            f"desvio={quant_error:.4e}"
+        )
+
+        if return_diag:
+            return None, gap_min, F_tilde
+
         return None
 
-    return int(C_round)
+    C = int(
+        C_round
+    )
 
-def eigenvalues_occ(eigvals, n_occ):
-    return eigvals[..., n_occ - 1]
+    if return_diag:
+        return C, gap_min, F_tilde
 
-def compute_chern_rigorous(Ko: float, h: float, eps2: float, eps3: float,
-                           N_init: int = 60, N_high: int = 120, n_occ: int = 3) -> int | None:
+    return C
+
+
+def _needs_mesh_refinement(
+    gap_min: float,
+    F_tilde: np.ndarray | None,
+) -> tuple[bool, str | None]:
     """
-    Executa a verificação adaptativa do gap e calcula o número de Chern rigorosamente.
-    """
-    has_gap, _ = check_gap_adaptive(Ko, h, eps2, eps3, n_occ=n_occ, N_init=N_init, N_high=N_high)
-    if not has_gap:
-        return None
+    Critério duplo para decidir se a malha grosseira deve ser substituída pela
+    malha N_high.
 
-    k1d = np.linspace(0.0, 2.0 * np.pi, N_init, endpoint=False)
-    kx_g, ky_g = np.meshgrid(k1d, k1d, indexing="ij")
-    H_batch = _hamiltonian_batch(kx_g, ky_g, Ko, h, eps2, eps3, alpha=0.5)
-    return fhs_chern_number(H_batch, n_occ)
+    Critério 1:
+        gap_min < REFINE_GAP_ABS
+
+    Critério 2:
+        fração do fluxo absoluto concentrada nas FLUX_TOPK maiores plaquetas
+        superior a FLUX_FRAC_THRESH.
+    """
+
+    if gap_min < REFINE_GAP_ABS:
+        return (
+            True,
+            "gap_absoluto",
+        )
+
+    if F_tilde is not None:
+        flat = np.abs(
+            F_tilde
+        ).ravel()
+
+        topk_flux = np.sort(
+            flat
+        )[-FLUX_TOPK:].sum()
+
+        total_flux = flat.sum()
+
+        topk_frac = (
+            topk_flux
+            / total_flux
+        )
+
+        if topk_frac > FLUX_FRAC_THRESH:
+            return (
+                True,
+                "concentracao_de_fluxo_berry",
+            )
+
+    return (
+        False,
+        None,
+    )
+
+
+def compute_chern_rigorous(
+    Ko: float,
+    h: float,
+    eps2: float,
+    eps3: float,
+    N_init: int = 60,
+    N_high: int = 120,
+    n_occ: int = 3,
+) -> int | None:
+    """
+    Calcula o número de Chern sobre a geometria correta da zona de Brillouin.
+
+    Procedimento:
+
+    1. Constrói a malha N_init na base recíproca B1/B2.
+    2. Diagonaliza o Hamiltoniano uma única vez nessa malha.
+    3. Calcula:
+         - Chern;
+         - gap mínimo;
+         - fluxo FHS por plaqueta.
+    4. Avalia _needs_mesh_refinement.
+    5. Se necessário, repete o cálculo em N_high.
+
+    A assinatura externa é mantida compatível com generate_dataset() e
+    generate_dataset_parallel().
+    """
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Malha inicial
+    # ─────────────────────────────────────────────────────────────────────────
+
+    kx0, ky0 = bz_grid(
+        N_init
+    )
+
+    H0 = _hamiltonian_batch(
+        kx0,
+        ky0,
+        Ko,
+        h,
+        eps2,
+        eps3,
+    )
+
+    C0, gap0, F0 = fhs_chern_number(
+        H0,
+        n_occ,
+        return_diag=True,
+    )
+
+    refine, _reason = _needs_mesh_refinement(
+        gap0,
+        F0,
+    )
+
+    if not refine:
+        return C0
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Malha refinada
+    # ─────────────────────────────────────────────────────────────────────────
+
+    kx1, ky1 = bz_grid(
+        N_high
+    )
+
+    H1 = _hamiltonian_batch(
+        kx1,
+        ky1,
+        Ko,
+        h,
+        eps2,
+        eps3,
+    )
+
+    C1, _gap1, _F1 = fhs_chern_number(
+        H1,
+        n_occ,
+        return_diag=True,
+    )
+
+    return C1
+
 
 def test_haldane_model():
-    print("Executando teste de validação do método FHS (Modelo de Haldane)...")
-    N, n_occ = 30, 1
-    k1d = np.linspace(0, 2 * np.pi, N, endpoint=False)
-    kx, ky = np.meshgrid(k1d, k1d, indexing="ij")
-    delta = np.array([[0.0, 1/np.sqrt(3)], [0.5, -0.5/np.sqrt(3)], [-0.5, -0.5/np.sqrt(3)]])
-    v1, v2, v3 = delta[1]-delta[2], delta[2]-delta[0], delta[0]-delta[1]
-    M_mass, t1, t2, phi = 0.3, 1.0, 0.1, np.pi/2
-    f_k = sum(np.exp(1j * (kx * d[0] + ky * d[1])) for d in delta)
-    sum_sin = sum(np.sin(kx * v[0] + ky * v[1]) for v in [v1, v2, v3])
-    d_z = M_mass - 2 * t2 * np.sin(phi) * sum_sin
-    H = np.zeros((N, N, 2, 2), dtype=complex)
+    """
+    Teste independente de regressão do integrador FHS usando o modelo de
+    Haldane em regime topológico.
+    """
+
+    print(
+        "Executando teste de validação do método FHS (Modelo de Haldane)..."
+    )
+
+    N = 30
+    n_occ = 1
+
+    k1d = np.linspace(
+        0,
+        2 * np.pi,
+        N,
+        endpoint=False,
+    )
+
+    kx, ky = np.meshgrid(
+        k1d,
+        k1d,
+        indexing="ij",
+    )
+
+    delta = np.array(
+        [
+            [0.0, 1 / np.sqrt(3)],
+            [0.5, -0.5 / np.sqrt(3)],
+            [-0.5, -0.5 / np.sqrt(3)],
+        ]
+    )
+
+    v1 = delta[1] - delta[2]
+    v2 = delta[2] - delta[0]
+    v3 = delta[0] - delta[1]
+
+    M_mass = 0.3
+    t1 = 1.0
+    t2 = 0.1
+    phi = np.pi / 2
+
+    f_k = sum(
+        np.exp(
+            1j
+            * (
+                kx * d[0]
+                + ky * d[1]
+            )
+        )
+        for d in delta
+    )
+
+    sum_sin = sum(
+        np.sin(
+            kx * v[0]
+            + ky * v[1]
+        )
+        for v in [
+            v1,
+            v2,
+            v3,
+        ]
+    )
+
+    d_z = (
+        M_mass
+        - 2
+        * t2
+        * np.sin(phi)
+        * sum_sin
+    )
+
+    H = np.zeros(
+        (
+            N,
+            N,
+            2,
+            2,
+        ),
+        dtype=complex,
+    )
+
     H[:, :, 0, 0] = d_z
     H[:, :, 1, 1] = -d_z
-    H[:, :, 0, 1] = t1 * f_k
-    H[:, :, 1, 0] = t1 * f_k.conj()
-    chern_val = fhs_chern_number(H, n_occ)
-    assert chern_val in [1, -1], f"FALHA! Obtido C = {chern_val}."
-    print(f"Sucesso! C = {chern_val}.\n")
+
+    H[:, :, 0, 1] = (
+        t1 * f_k
+    )
+
+    H[:, :, 1, 0] = (
+        t1 * f_k.conj()
+    )
+
+    chern_val = fhs_chern_number(
+        H,
+        n_occ,
+    )
+
+    assert chern_val in [
+        1,
+        -1,
+    ], (
+        f"FALHA! Obtido C = {chern_val}."
+    )
+
+    print(
+        f"Sucesso! C = {chern_val}.\n"
+    )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MODULE 3 — GERADOR DE DATASET COM DISTRIBUIÇÃO FÍSICA REAL
 # ══════════════════════════════════════════════════════════════════════════════
 
-CSV_PATH = Path("topological_dataset.csv")
-_BOUNDS = {"Ko": (0.0, 3.0), "h": (-5.0, 5.0), "eps2": (0.0, 1.5), "eps3": (0.0, 1.5)}
+CSV_PATH = Path(
+    "topological_dataset.csv"
+)
 
-def generate_dataset(n_samples=5000, N_bz=60, n_occ=3, seed=42, out=CSV_PATH):
+_BOUNDS = {
+    "Ko": (
+        0.0,
+        3.0,
+    ),
+    "h": (
+        -5.0,
+        5.0,
+    ),
+    "eps2": (
+        0.0,
+        1.5,
+    ),
+    "eps3": (
+        0.0,
+        1.5,
+    ),
+}
+
+
+def generate_dataset(
+    n_samples=5000,
+    N_bz=60,
+    n_occ=3,
+    seed=42,
+    out=CSV_PATH,
+):
     """
-    Gera o dataset de fases topológicas amostrando aleatoriamente o espaço R^4.
-    Reflete a prevalência natural (~1% de fases não-triviais) sem rebalanceamento artificial.
+    Gera dataset de fases topológicas amostrando aleatoriamente o espaço R^4.
+
+    A prevalência das classes é determinada diretamente pelo oráculo FHS.
     """
-    rng = np.random.default_rng(seed)
+
+    rng = np.random.default_rng(
+        seed
+    )
+
     valid_rows = []
-    print(f"Gerando dataset com {n_samples} amostras topologicamente válidas...")
-    pbar = tqdm(total=n_samples, desc="FHS Integrator Rigoroso")
+
+    print(
+        f"Gerando dataset com {n_samples} "
+        "amostras topologicamente válidas..."
+    )
+
+    pbar = tqdm(
+        total=n_samples,
+        desc="FHS Integrator Rigoroso",
+    )
 
     while len(valid_rows) < n_samples:
-        batch_size = min(500, n_samples - len(valid_rows) + 200)
-        Ko_v = rng.uniform(*_BOUNDS["Ko"], batch_size)
-        h_v = rng.uniform(*_BOUNDS["h"], batch_size)
-        eps2_v = rng.uniform(*_BOUNDS["eps2"], batch_size)
-        eps3_v = rng.uniform(*_BOUNDS["eps3"], batch_size)
+        batch_size = min(
+            500,
+            n_samples
+            - len(valid_rows)
+            + 200,
+        )
 
-        for i in range(batch_size):
-            if len(valid_rows) >= n_samples: break
-            c = compute_chern_rigorous(Ko_v[i], h_v[i], eps2_v[i], eps3_v[i], N_init=N_bz, n_occ=n_occ)
+        Ko_v = rng.uniform(
+            *_BOUNDS["Ko"],
+            batch_size,
+        )
+
+        h_v = rng.uniform(
+            *_BOUNDS["h"],
+            batch_size,
+        )
+
+        eps2_v = rng.uniform(
+            *_BOUNDS["eps2"],
+            batch_size,
+        )
+
+        eps3_v = rng.uniform(
+            *_BOUNDS["eps3"],
+            batch_size,
+        )
+
+        for i in range(
+            batch_size
+        ):
+            if len(valid_rows) >= n_samples:
+                break
+
+            c = compute_chern_rigorous(
+                Ko_v[i],
+                h_v[i],
+                eps2_v[i],
+                eps3_v[i],
+                N_init=N_bz,
+                n_occ=n_occ,
+            )
+
             if c is not None:
-                valid_rows.append((Ko_v[i], h_v[i], eps2_v[i], eps3_v[i], c))
-                pbar.update(1)
+                valid_rows.append(
+                    (
+                        Ko_v[i],
+                        h_v[i],
+                        eps2_v[i],
+                        eps3_v[i],
+                        c,
+                    )
+                )
+
+                pbar.update(
+                    1
+                )
 
     pbar.close()
-    df = pd.DataFrame(valid_rows, columns=["Ko", "h", "eps2", "eps3", "chern"])
-    df.to_csv(out, index=False)
-    print(f"\nDataset gerado -> {out}")
-    print("Distribuição Real das Classes Topológicas (Chern):")
-    counts = df["chern"].value_counts().sort_index()
-    print(counts.to_string())
-    non_trivial = (df["chern"] != 0).sum()
-    print(f"Prevalência Real de Fases Não-Triviais (C != 0): {non_trivial / len(df):.2%}")
+
+    df = pd.DataFrame(
+        valid_rows,
+        columns=[
+            "Ko",
+            "h",
+            "eps2",
+            "eps3",
+            "chern",
+        ],
+    )
+
+    df.to_csv(
+        out,
+        index=False,
+    )
+
+    print(
+        f"\nDataset gerado -> {out}"
+    )
+
+    print(
+        "Distribuição Real das Classes Topológicas (Chern):"
+    )
+
+    counts = (
+        df["chern"]
+        .value_counts()
+        .sort_index()
+    )
+
+    print(
+        counts.to_string()
+    )
+
+    non_trivial = (
+        df["chern"] != 0
+    ).sum()
+
+    print(
+        "Prevalência Real de Fases Não-Triviais "
+        f"(C != 0): {non_trivial / len(df):.2%}"
+    )
+
     return df
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# MODULE 3b — GERAÇÃO PARALELA (multiprocessing; VETORIZAÇÃO EM LOTE TESTADA E
-# DESCARTADA -- ver "erro 1" no relatório: mais lenta que o loop escalar em
-# todos os tamanhos de lote testados, 1 a 96 pontos, neste oráculo)
+# MODULE 3b — GERAÇÃO PARALELA
 # ══════════════════════════════════════════════════════════════════════════════
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    as_completed,
+)
 import os
 
 
-def _generate_chunk(n_target: int, N_bz: int, n_occ: int, entropy: int, worker_id: int):
-    """Executado em processo separado. compute_chern_rigorous NÃO é modificado
-    -- só distribuído. Stream aleatório independente via SeedSequence.spawn
-    (não seed+worker_id manual, que pode gerar streams correlacionados)."""
-    rng = np.random.default_rng(entropy)
+def _generate_chunk(
+    n_target: int,
+    N_bz: int,
+    n_occ: int,
+    entropy: int,
+    worker_id: int,
+):
+    """
+    Executado em processo separado.
+
+    O oráculo físico compute_chern_rigorous não é modificado; apenas distribuído
+    entre processos.
+
+    Cada processo recebe um stream aleatório derivado de SeedSequence.spawn.
+    """
+
+    rng = np.random.default_rng(
+        entropy
+    )
+
     rows = []
+
     while len(rows) < n_target:
-        batch = min(500, n_target - len(rows) + 200)
-        Ko_v = rng.uniform(*_BOUNDS["Ko"], batch)
-        h_v = rng.uniform(*_BOUNDS["h"], batch)
-        e2_v = rng.uniform(*_BOUNDS["eps2"], batch)
-        e3_v = rng.uniform(*_BOUNDS["eps3"], batch)
-        for i in range(batch):
+        batch = min(
+            500,
+            n_target
+            - len(rows)
+            + 200,
+        )
+
+        Ko_v = rng.uniform(
+            *_BOUNDS["Ko"],
+            batch,
+        )
+
+        h_v = rng.uniform(
+            *_BOUNDS["h"],
+            batch,
+        )
+
+        e2_v = rng.uniform(
+            *_BOUNDS["eps2"],
+            batch,
+        )
+
+        e3_v = rng.uniform(
+            *_BOUNDS["eps3"],
+            batch,
+        )
+
+        for i in range(
+            batch
+        ):
             if len(rows) >= n_target:
                 break
-            c = compute_chern_rigorous(Ko_v[i], h_v[i], e2_v[i], e3_v[i], N_init=N_bz, n_occ=n_occ)
+
+            c = compute_chern_rigorous(
+                Ko_v[i],
+                h_v[i],
+                e2_v[i],
+                e3_v[i],
+                N_init=N_bz,
+                n_occ=n_occ,
+            )
+
             if c is not None:
-                rows.append((Ko_v[i], h_v[i], e2_v[i], e3_v[i], c))
-    return worker_id, rows
+                rows.append(
+                    (
+                        Ko_v[i],
+                        h_v[i],
+                        e2_v[i],
+                        e3_v[i],
+                        c,
+                    )
+                )
+
+    return (
+        worker_id,
+        rows,
+    )
 
 
-def generate_dataset_parallel(n_samples=50_000, N_bz=60, n_occ=3, seed=42,
-                               out=CSV_PATH, n_workers=None):
-    """Mesma distribuição/oráculo do generate_dataset original -- nenhuma
-    linha de física alterada. Determinístico: reexecutar com o mesmo
-    (seed, n_workers) reproduz byte-a-byte o mesmo dataset (validado)."""
-    n_workers = n_workers or os.cpu_count() or 1
-    per_worker = [n_samples // n_workers] * n_workers
-    for i in range(n_samples % n_workers):
+def generate_dataset_parallel(
+    n_samples=50_000,
+    N_bz=60,
+    n_occ=3,
+    seed=42,
+    out=CSV_PATH,
+    n_workers=None,
+):
+    """
+    Versão paralela do gerador de dataset.
+
+    A física e o oráculo são idênticos aos utilizados por generate_dataset().
+    Os streams pseudoaleatórios individuais são derivados de SeedSequence.spawn.
+    """
+
+    n_workers = (
+        n_workers
+        or os.cpu_count()
+        or 1
+    )
+
+    per_worker = (
+        [n_samples // n_workers]
+        * n_workers
+    )
+
+    for i in range(
+        n_samples % n_workers
+    ):
         per_worker[i] += 1
-    entropies = [int(cs.generate_state(1)[0]) for cs in np.random.SeedSequence(seed).spawn(n_workers)]
 
-    print(f"Gerando {n_samples} amostras em {n_workers} processo(s)...")
+    seed_sequence = np.random.SeedSequence(
+        seed
+    )
+
+    child_sequences = seed_sequence.spawn(
+        n_workers
+    )
+
+    entropies = [
+        int(
+            child.generate_state(
+                1
+            )[0]
+        )
+        for child in child_sequences
+    ]
+
+    print(
+        f"Gerando {n_samples} amostras "
+        f"em {n_workers} processo(s)..."
+    )
+
     t0 = time.perf_counter()
-    all_rows = []
-    with ProcessPoolExecutor(max_workers=n_workers) as ex:
-        futs = [ex.submit(_generate_chunk, per_worker[w], N_bz, n_occ, entropies[w], w)
-                for w in range(n_workers)]
-        for fut in as_completed(futs):
-            wid, rows = fut.result()
-            print(f"  worker {wid}: {len(rows)} amostras validas")
-            all_rows.extend(rows)
-    dt = time.perf_counter() - t0
 
-    df = pd.DataFrame(all_rows, columns=["Ko", "h", "eps2", "eps3", "chern"])
-    df.to_csv(out, index=False)
-    print(f"\n{len(df)} amostras -> {out}  ({dt:.1f}s, {dt/len(df)*1000:.2f} ms/amostra efetivo)")
-    counts = df["chern"].value_counts().sort_index()
-    print(counts.to_string())
-    print(f"Prevalencia nao-trivial: {(df['chern']!=0).sum()/len(df):.2%}")
+    all_rows = []
+
+    with ProcessPoolExecutor(
+        max_workers=n_workers
+    ) as executor:
+        futures = [
+            executor.submit(
+                _generate_chunk,
+                per_worker[w],
+                N_bz,
+                n_occ,
+                entropies[w],
+                w,
+            )
+            for w in range(
+                n_workers
+            )
+        ]
+
+        for future in as_completed(
+            futures
+        ):
+            worker_id, rows = (
+                future.result()
+            )
+
+            print(
+                f"  worker {worker_id}: "
+                f"{len(rows)} amostras validas"
+            )
+
+            all_rows.extend(
+                rows
+            )
+
+    dt = (
+        time.perf_counter()
+        - t0
+    )
+
+    df = pd.DataFrame(
+        all_rows,
+        columns=[
+            "Ko",
+            "h",
+            "eps2",
+            "eps3",
+            "chern",
+        ],
+    )
+
+    df.to_csv(
+        out,
+        index=False,
+    )
+
+    print(
+        f"\n{len(df)} amostras -> {out} "
+        f"({dt:.1f}s, "
+        f"{dt / len(df) * 1000:.2f} ms/amostra efetivo)"
+    )
+
+    counts = (
+        df["chern"]
+        .value_counts()
+        .sort_index()
+    )
+
+    print(
+        counts.to_string()
+    )
+
+    prevalence = (
+        (df["chern"] != 0).sum()
+        / len(df)
+    )
+
+    print(
+        "Prevalencia nao-trivial: "
+        f"{prevalence:.2%}"
+    )
+
     return df
 
 
 if __name__ == "__main__":
     test_haldane_model()
-    generate_dataset_parallel(n_samples=50000, N_bz=60, n_occ=3, seed=42)
+
+    generate_dataset_parallel(
+        n_samples=50_000,
+        N_bz=60,
+        n_occ=3,
+        seed=42,
+    )
