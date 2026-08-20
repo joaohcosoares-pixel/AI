@@ -138,11 +138,10 @@ def test_oracle_routing_and_confidence_overconfidence_mitigation():
     outlier_scaled = guard.mu + 10.0 * np.std(X_train_scaled, axis=0)
     outlier_raw = scaler.inverse_transform(outlier_scaled.reshape(1, -1))[0]
 
-    # Forçamos o ponto 4 a ficar dentro do BBox mas criamos um ponto com Mahalanobis alto manipulando a covariância
     p1 = np.array([4.45, 0.0, 0.0, 0.0])              # Dentro, normal
     p2 = np.array([2.05, 0.0, 0.0, 0.0])              # Dentro, candidato a não-trivial
     p3 = np.array([12.50, 0.0, 0.0, 0.0])             # FORA do BBox (M=12.5)
-    p4 = np.array([6.94, 0.99, 0.99, 0.99])           # Vértice extremo (alta distância de Mahalanobis)
+    p4 = np.array([6.949, 0.999, 0.999, 0.999])       # Vértice extremo dentro do BBox (alta distância de Mahalanobis)
 
     X_eval = np.vstack([p1, p2, p3, p4])
     probs_nt = np.array([0.01, 0.85, 0.001, 0.002])   # MLP tem confiança cega nos pontos 1, 3 e 4
@@ -166,10 +165,11 @@ def test_oracle_routing_and_confidence_overconfidence_mitigation():
     assert routing["threshold_mask"][1] == True
     assert routing["flagged_for_oracle"][1] == True
 
-    # Ponto 4: se exceder o limiar de Mahalanobis, deve ser OOD e flagged
-    if not routing["in_density"][3]:
-        assert routing["ood_mask"][3] == True
-        assert routing["flagged_for_oracle"][3] == True
+    # Ponto 4: dentro do BBox, mas interceptado incondicionalmente pelo portão de Mahalanobis
+    assert routing["in_bbox"][3] == True
+    assert routing["in_density"][3] == False
+    assert routing["ood_mask"][3] == True
+    assert routing["flagged_for_oracle"][3] == True
 
     print("✓ Teste 3: Política de Fallback Mandatório e Mitigação de Saturação Cega aprovados.")
 

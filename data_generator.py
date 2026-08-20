@@ -6,7 +6,7 @@ data_generator.py
 Módulos de Física Numérica e Oráculo FHS (Refatorado & Rigoroso):
 1. Bulk Hamiltonian Engine (Qi-Wu-Zhang)
 2. FHS Chern Integrator (com verificação adaptativa de gap, log de singularidade e trava inteira)
-3. Monte Carlo Dataset Generator (com prevalência física real e balanceamento seguro)
+3. Monte Carlo Dataset Generator (Prevalência de Evento Raro induzida pelo prior uniforme de amostragem prescrito)
 """
 
 import logging
@@ -136,7 +136,7 @@ def fhs_chern_number(
         return None
 
     U_plaquette = U1 * np.roll(U2, -1, axis=0) * np.roll(U1, -1, axis=1).conj() * U2.conj()
-    F_tilde = np.angle(U_plaquette + 1e-10j)
+    F_tilde = np.angle(U_plaquette)
     
     C_raw = F_tilde.sum() / (2.0 * np.pi)
     C_round = np.round(C_raw)
@@ -248,7 +248,7 @@ def test_haldane_model():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODULE 3 — GERADOR DE DATASET COM DISTRIBUIÇÃO FÍSICA REAL
+# MODULE 3 — GERADOR DE DATASET (Prevalência de Evento Raro induzida pelo prior uniforme de amostragem prescrito)
 # ══════════════════════════════════════════════════════════════════════════════
 
 CSV_PATH = Path("topological_dataset.csv")
@@ -263,11 +263,13 @@ _BOUNDS = {
 
 def generate_dataset(n_samples=5000, N_bz=60, n_occ=3, seed=42, out=CSV_PATH):
     """
-    Gera dataset de fases topológicas amostrando aleatoriamente o espaço R^4.
-    A prevalência das classes é determinada diretamente pelo oráculo FHS.
+    Gera dataset de fases topológicas amostrando aleatoriamente o espaço R^4 sob prior uniforme prescrito.
+    A prevalência de evento raro é induzida pelo prior uniforme de amostragem prescrito sobre o espaço de parâmetros.
     """
     rng = np.random.default_rng(seed)
     valid_rows = []
+    total_sampled = 0
+    rejected_count = 0
 
     print(f"Gerando dataset com {n_samples} amostras topologicamente válidas...")
     pbar = tqdm(total=n_samples, desc="FHS Integrator Rigoroso")
@@ -284,24 +286,31 @@ def generate_dataset(n_samples=5000, N_bz=60, n_occ=3, seed=42, out=CSV_PATH):
             if len(valid_rows) >= n_samples:
                 break
 
+            total_sampled += 1
             c = compute_chern_rigorous(M_v[i], p2_v[i], p3_v[i], p4_v[i], N_init=N_bz, n_occ=n_occ)
 
             if c is not None:
                 valid_rows.append((M_v[i], p2_v[i], p3_v[i], p4_v[i], c))
                 pbar.update(1)
+            else:
+                rejected_count += 1
 
     pbar.close()
 
     df = pd.DataFrame(valid_rows, columns=["M", "p2", "p3", "p4", "chern"])
     df.to_csv(out, index=False)
 
+    oracle_invalid_rate = (rejected_count / total_sampled) if total_sampled > 0 else 0.0
+
     print(f"\nDataset gerado -> {out}")
-    print("Distribuição Real das Classes Topológicas (Chern):")
+    print(f"Total de pontos amostrados: {total_sampled}")
+    print(f"Taxa de Rejeição do Oráculo (Oracle-Invalid Rate): {oracle_invalid_rate:.2%} ({rejected_count}/{total_sampled} pontos rejeitados)")
+    print("Distribuição das Classes Topológicas (Chern):")
     counts = df["chern"].value_counts().sort_index()
     print(counts.to_string())
 
     non_trivial = (df["chern"] != 0).sum()
-    print(f"Prevalência Real de Fases Não-Triviais (C != 0): {non_trivial / len(df):.2%}")
+    print(f"Prevalência de Evento Raro induzida pelo prior uniforme de amostragem prescrito (C != 0): {non_trivial / len(df):.2%}")
 
     return df
 
@@ -322,6 +331,8 @@ def _generate_chunk(n_target: int, N_bz: int, n_occ: int, entropy: int, worker_i
     """
     rng = np.random.default_rng(entropy)
     rows = []
+    total_sampled = 0
+    rejected_count = 0
 
     while len(rows) < n_target:
         batch = min(500, n_target - len(rows) + 200)
@@ -335,12 +346,15 @@ def _generate_chunk(n_target: int, N_bz: int, n_occ: int, entropy: int, worker_i
             if len(rows) >= n_target:
                 break
 
+            total_sampled += 1
             c = compute_chern_rigorous(M_v[i], p2_v[i], p3_v[i], p4_v[i], N_init=N_bz, n_occ=n_occ)
 
             if c is not None:
                 rows.append((M_v[i], p2_v[i], p3_v[i], p4_v[i], c))
+            else:
+                rejected_count += 1
 
-    return worker_id, rows
+    return worker_id, rows, total_sampled, rejected_count
 
 
 def generate_dataset_parallel(n_samples=50_000, N_bz=60, n_occ=3, seed=42, out=CSV_PATH, n_workers=None):
@@ -362,6 +376,8 @@ def generate_dataset_parallel(n_samples=50_000, N_bz=60, n_occ=3, seed=42, out=C
     print(f"Gerando {n_samples} amostras em {n_workers} processo(s)...")
     t0 = time.perf_counter()
     by_worker = {}
+    total_sampled = 0
+    total_rejected = 0
 
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
         futures = [
@@ -370,9 +386,11 @@ def generate_dataset_parallel(n_samples=50_000, N_bz=60, n_occ=3, seed=42, out=C
         ]
 
         for future in as_completed(futures):
-            worker_id, rows = future.result()
-            print(f"  worker {worker_id}: {len(rows)} amostras validas")
+            worker_id, rows, w_sampled, w_rejected = future.result()
+            print(f"  worker {worker_id}: {len(rows)} amostras validas ({w_rejected}/{w_sampled} rejeitadas)")
             by_worker[worker_id] = rows
+            total_sampled += w_sampled
+            total_rejected += w_rejected
 
     all_rows = []
     for w in range(n_workers):
@@ -383,13 +401,17 @@ def generate_dataset_parallel(n_samples=50_000, N_bz=60, n_occ=3, seed=42, out=C
     df = pd.DataFrame(all_rows, columns=["M", "p2", "p3", "p4", "chern"])
     df.to_csv(out, index=False)
 
+    oracle_invalid_rate = (total_rejected / total_sampled) if total_sampled > 0 else 0.0
+
     print(f"\n{len(df)} amostras -> {out} ({dt:.1f}s, {dt / len(df) * 1000:.2f} ms/amostra efetivo)")
+    print(f"Total de pontos amostrados: {total_sampled}")
+    print(f"Taxa de Rejeição do Oráculo (Oracle-Invalid Rate): {oracle_invalid_rate:.2%} ({total_rejected}/{total_sampled} pontos rejeitados)")
 
     counts = df["chern"].value_counts().sort_index()
     print(counts.to_string())
 
     prevalence = (df["chern"] != 0).sum() / len(df)
-    print(f"Prevalencia nao-trivial: {prevalence:.2%}")
+    print(f"Prevalência de Evento Raro induzida pelo prior uniforme de amostragem prescrito: {prevalence:.2%}")
 
     return df
 

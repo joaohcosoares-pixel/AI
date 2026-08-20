@@ -9,7 +9,7 @@ Módulo de Confiabilidade de Software Científico e Guarda de Domínio OOD
 Mitiga a falha estrutural de "Saturação Cega de Confiança" (Blind Softmax
 Overconfidence) através de dupla contenção geométrica e estatística:
   1. Barreira Geométrica (Bounding Box Físico)
-  2. Filtro de Densidade Espectral (Distância de Mahalanobis com Regularização)
+  2. Filtro de Densidade Espectral (Distância de Mahalanobis como Conservative Statistical Rejection Gate)
   3. Política de Fallback Mandatório ao Oráculo FHS (threshold_mask | ood_mask)
 """
 
@@ -31,7 +31,7 @@ class TopoDomainGuard:
          exatos [_BOUNDS] do modelo. Amostras com pelo menos uma feature
          violando [min, max] são flagradas como in_bbox = False.
 
-      2. Filtro Espectral de Mahalanobis (Elipsoide de Centralidade):
+      2. Filtro Espectral de Mahalanobis (Conservative Statistical Rejection Gate):
          Mede a distância estatística de Mahalanobis no espaço padronizado
          exclusivamente com base no conjunto de treino:
            D_M(x) = sqrt( (x - mu)^T * (Sigma + eps*I)^(-1) * (x - mu) )
@@ -39,6 +39,11 @@ class TopoDomainGuard:
          O limiar estatístico (maha_threshold) é fixado no percentil 99.5
          (q_99.5) do conjunto de treino. Amostras com D_M > maha_threshold
          são flagradas como in_density = False.
+
+         NOTA DE RIGOR ESTATÍSTICO:
+         A Distância de Mahalanobis atua como um "Conservative statistical rejection gate"
+         (elipsoide de centralidade global sobre as características), e não como uma
+         prova formal exaustiva de todo e qualquer suporte OOD.
 
       3. Política de Fallback Mandatório ao Oráculo:
          A confiança da rede neural é estritamente submissa ao Guarda de Domínio:

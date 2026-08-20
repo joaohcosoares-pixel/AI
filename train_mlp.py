@@ -1,36 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train_mlp.py — Pipeline de Avaliação Estatística "Double-Blind" & Treinamento
+train_mlp.py — Pipeline de Avaliação Estatística Rigorosa com Isolamento Out-of-Sample Estrito
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Classificação de Fases Topológicas com Rigor Metodológico para Periódicos Qualis A1.
+Classificação de Fases Topológicas com Rigor Metodológico para Periódicos de Alto Impacto.
 
 Princípios Metodológicos e Estruturais Implementados:
-1. ISOLAMENTO ABSOLUTO DE HOLDOUT EXTERNO (Double-Blind Protocol):
-   - Partição global inicial (85% Desenvolvimento / 15% Holdout Cego Externo)
+1. ISOLAMENTO OUT-OF-SAMPLE ESTRITO:
+   - Partição global inicial (85% Desenvolvimento / 15% Holdout Externo)
      sob semente fixa e estratificação estrita.
-   - O Holdout Cego é colocado em quarentena estrita e permanece intocado
-     durante toda a fase de exploração, busca de hiperparâmetros, treino multi-seed
-     e fixação de limiares.
+   - O Holdout Externo é colocado em quarentena estrita e permanece intocado
+     durante toda a fase de exploração, busca de hiperparâmetros, avaliação 5x2 CV,
+     estimativa de prevalência e fixação de limiares.
    - A escolha do modelo de produção é conduzida exclusivamente a partir do
-     desempenho na validação interna do conjunto de desenvolvimento.
-   - O conjunto Holdout Cego é avaliado exatamente 1 (uma) única vez no final do
+     desempenho na validação interna do conjunto de desenvolvimento de forma simétrica e independente.
+   - O conjunto Holdout Externo é avaliado exatamente 1 (uma) única vez no final do
      pipeline, garantindo estimativas de generalização não enviesadas.
 
-2. PAREAMENTO SIMÉTRICO DE BASELINES (30 vs 30 sementes):
-   - Os baselines clássicos (Random Forest Balanceado e Regressão Logística Balanceada)
-     são avaliados exatamente nas mesmas 30 sementes (0 a 29) que a MLP.
-   - Compartilham idênticos splits de treino/validação interna e a mesma padronização
-     (StandardScaler ajustado estritamente no conjunto de treino de cada semente).
+2. PROTOCOLO 5x2 CROSS-VALIDATION (Dietterich / Nadeau-Bengio):
+   - Executa 5 iterações com partição estratificada 50%/50% (treino/validação) sobre X_dev,
+     invertendo os papéis para gerar 10 dobras (folds) controladas.
+   - MLP, Random Forest Balanceado e Regressão Logística Balanceada operam exatamente
+     nas mesmas 10 dobras e sob a mesma padronização ajustada estritamente no treino de cada dobra.
 
-3. INFERÊNCIA ESTATÍSTICA PAREADA (Testes de Diferença Semente a Semente):
-   - Armazenamento vetorizado das métricas pareadas por semente.
+3. INFERÊNCIA ESTATÍSTICA PAREADA (Testes 5x2 CV para ΔFPR e ΔF1-Macro):
    - Cálculo da distribuição das diferenças pareadas:
-       ΔRecall = Recall_MLP - Recall_Baseline
        ΔFPR = FPR_MLP - FPR_Baseline
        ΔF1_macro = F1_MLP - F1_Baseline
-   - Reporte da média pareada, erro padrão, intervalo de confiança de 95% via
-     distribuição t de Student (df = n - 1) e teste de hipótese bicaudal (H0: μ_Δ = 0).
+   - Reporte da média pareada, erro padrão, IC de 95% e teste de hipótese 5x2 CV de Dietterich (df = 5).
+   - Omitida a comparação tautológica de ΔRecall na validação (fixada em 100% pelo limiar k=0).
 
 4. HEURÍSTICA FIXA DE ALTA SENSIBILIDADE (k=0):
    - O limiar de corte operacional é fixado determinística e estritamente no
@@ -79,7 +77,8 @@ CSV_PATH: Path = Path("topological_dataset.csv")
 FEATURES: List[str] = ["M", "p2", "p3", "p4"]
 GLOBAL_HOLDOUT_SEED: int = 42
 HOLDOUT_TEST_SIZE: float = 0.15
-N_SEEDS_EVALUATION: int = 30
+N_5X2CV_ITERATIONS: int = 5
+N_SEEDS_EVALUATION: int = 10
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -292,7 +291,7 @@ def apply_high_sensitivity_threshold(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MÓDULO 4 — MOTOR DE INFERÊNCIA ESTATÍSTICA PAREADA
+# MÓDULO 4 — MOTOR DE INFERÊNCIA ESTATÍSTICA PAREADA (5x2 Cross-Validation)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_paired_differences(
@@ -301,12 +300,12 @@ def compute_paired_differences(
     confidence_level: float = 0.95,
 ) -> Dict[str, Any]:
     """
-    Calcula estatísticas pareadas semente a semente para a diferença Delta = Metric_A - Metric_B:
-      - Média amostral pareada (mu_Delta)
-      - Desvio padrão amostral pareado (s_Delta)
-      - Erro padrão da média (SEM)
-      - Intervalo de Confiança bicaudal via distribuição t de Student com df = n - 1
-      - Estatística t e p-valor bicaudal (teste t pareado sob H0: mu_Delta = 0)
+    Calcula estatísticas pareadas sob o protocolo 5x2 Cross-Validation (Dietterich, 1998):
+      - 5 replicações com 2 dobras controladas (total de 10 dobras).
+      - Para cada replicação r, variância s_r^2 = (p_{r,0} - p_bar_r)^2 + (p_{r,1} - p_bar_r)^2.
+      - Estimativa de variância de Dietterich: s_5x2^2 = (1/5) * sum_{r=0}^4 s_r^2.
+      - Estatística t_5x2 = p_{0,0} / sqrt(s_5x2^2) com 5 graus de liberdade (df = 5).
+      - Média pareada (mu_Delta), desvio padrão amostral (s_Delta) e IC 95% sobre as 10 dobras.
     """
     diffs = np.asarray(metric_a, dtype=np.float64) - np.asarray(metric_b, dtype=np.float64)
     n = len(diffs)
@@ -319,7 +318,18 @@ def compute_paired_differences(
     ci_lower = mean_diff - t_crit * sem_diff
     ci_upper = mean_diff + t_crit * sem_diff
 
-    t_stat, p_value = stats.ttest_1samp(diffs, 0.0) if n > 1 else (0.0, 1.0)
+    # Protocolo 5x2 CV de Dietterich (df = 5) se n == 10
+    if n == 10:
+        diff_pairs = diffs.reshape(5, 2)
+        p0_1 = float(diff_pairs[0, 0])
+        r_means = np.mean(diff_pairs, axis=1)
+        s_r_sq = np.sum((diff_pairs - r_means[:, None]) ** 2, axis=1)
+        s_pooled_sq = float(np.mean(s_r_sq))  # (1/5) * sum(s_r_sq)
+        denom = np.sqrt(s_pooled_sq) if s_pooled_sq > 1e-15 else 1e-15
+        t_stat = float(p0_1 / denom)
+        p_value = float(2.0 * (1.0 - stats.t.cdf(np.abs(t_stat), df=5)))
+    else:
+        t_stat, p_value = stats.ttest_1samp(diffs, 0.0) if n > 1 else (0.0, 1.0)
 
     return {
         "n": n,
@@ -338,11 +348,12 @@ def print_comparative_statistical_report(
     df_runs: pd.DataFrame, n_seeds: int
 ) -> None:
     """
-    Imprime relatório formatado de auditoria estatística agregada e análise pareada
-    semente a semente (MLP vs Random Forest e MLP vs Regressão Logística).
+    Imprime relatório formatado de auditoria estatística 5x2 CV agregada e análise pareada
+    dobra a dobra (MLP vs Random Forest e MLP vs Regressão Logística).
+    Exclui comparações tautológicas de Recall (fixadas em 100% pelo limiar k=0).
     """
     print(f"\n{'=' * 86}")
-    print(f" RELATÓRIO ESTATÍSTICO MULTI-SEED ({n_seeds} SEMENTES NO CONJUNTO DE DESENVOLVIMENTO)")
+    print(f" RELATÓRIO ESTATÍSTICO 5x2 CROSS-VALIDATION ({n_seeds} DOBRAS NO DESENVOLVIMENTO)")
     print(f"{'=' * 86}")
 
     # 1. Tabela de Desempenho Agregado Absoluto (mu +- sigma, min, max)
@@ -363,25 +374,25 @@ def print_comparative_statistical_report(
         })
 
     df_summary_abs = pd.DataFrame(summary_rows)
-    print("\n--- 1. DESEMPENHO AGREGADO ABSOLUTO (Validação Interna) ---")
+    print("\n--- 1. DESEMPENHO AGREGADO ABSOLUTO (Validação Interna — 10 Dobras) ---")
     print(df_summary_abs.to_string(index=False))
 
-    # 2. Estatística Pareada de Diferença Semente a Semente (Δ = MLP - Baseline)
-    sub_mlp = df_runs[df_runs["modelo"] == "MLP"].sort_values("seed")
-    sub_rf = df_runs[df_runs["modelo"] == "RandomForest"].sort_values("seed")
-    sub_lr = df_runs[df_runs["modelo"] == "LogisticRegression"].sort_values("seed")
+    # 2. Estatística Pareada de Diferença 5x2 CV (Δ = MLP - Baseline)
+    sub_mlp = df_runs[df_runs["modelo"] == "MLP"].sort_values("fold_id" if "fold_id" in df_runs.columns else "seed")
+    sub_rf = df_runs[df_runs["modelo"] == "RandomForest"].sort_values("fold_id" if "fold_id" in df_runs.columns else "seed")
+    sub_lr = df_runs[df_runs["modelo"] == "LogisticRegression"].sort_values("fold_id" if "fold_id" in df_runs.columns else "seed")
 
     paired_comparisons = [
         ("MLP vs RandomForest", sub_mlp, sub_rf),
         ("MLP vs LogisticRegression", sub_mlp, sub_lr),
     ]
 
-    print(f"\n--- 2. INFERÊNCIA ESTATÍSTICA PAREADA (Δ = MLP - Baseline, N={n_seeds} Sementes) ---")
+    print(f"\n--- 2. INFERÊNCIA ESTATÍSTICA PAREADA 5x2 CV (Δ = MLP - Baseline, {n_seeds} Dobras) ---")
+    print(" (Nota: Comparação de ΔRecall omitida pois a heurística k=0 fixa 100% de Recall na validação)")
     paired_rows = []
 
     for name, df_a, df_b in paired_comparisons:
         for metric_key, label in [
-            ("recall_val", "Δ Recall"),
             ("fpr_val", "Δ FPR"),
             ("f1_macro_val", "Δ F1-Macro"),
         ]:
@@ -395,8 +406,8 @@ def print_comparative_statistical_report(
                 "Média Δ (μ_Δ)": f"{stats_p['mean_diff']:+.4f}",
                 "IC 95% [Inf, Sup]": f"[{stats_p['ci_lower']:+.4f}, {stats_p['ci_upper']:+.4f}]",
                 "Desvio (s_Δ)": f"{stats_p['std_diff']:.4f}",
-                "Estatística t": f"{stats_p['t_stat']:+.3f}",
-                "p-valor": f"{stats_p['p_value']:.4e} ({sig_marker})",
+                "Estatística t (5x2)": f"{stats_p['t_stat']:+.3f}",
+                "p-valor (5x2 CV)": f"{stats_p['p_value']:.4e} ({sig_marker})",
             })
 
     df_paired = pd.DataFrame(paired_rows)
@@ -405,7 +416,7 @@ def print_comparative_statistical_report(
     # Diagnóstico de Colapso do RandomForest sob a heurística k=0
     rf_collapse_count = int((sub_rf["limiar"] == 0.0).sum())
     print(f"\n--- 3. DIAGNÓSTICO METODOLÓGICO DE COLAPSO DE LIMIAR (Random Forest) ---")
-    print(f" Sementes com colapso de limiar no RF (limiar = 0.0 -> FPR = 100%): "
+    print(f" Dobras com colapso de limiar no RF (limiar = 0.0 -> FPR = 100%): "
           f"{rf_collapse_count}/{n_seeds} ({rf_collapse_count / n_seeds:.1%})")
     print(f" Nota: Árvores de decisão puras geram folhas onde a probabilidade empírica "
           f"atribuída a um ponto positivo pode atingir 0.0 exato, colapsando a heurística k=0.")
@@ -531,7 +542,7 @@ def train_mlp_single_seed(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MÓDULO 6 — LOOP MULTI-SEED SIMÉTRICO NO CONJUNTO DE DESENVOLVIMENTO (30 vs 30)
+# MÓDULO 6 — PROTOCOLO 5x2 CROSS-VALIDATION NO DESENVOLVIMENTO (10 DOBRAS)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_symmetric_multiseed_evaluation(
@@ -539,22 +550,23 @@ def run_symmetric_multiseed_evaluation(
     y_dev: np.ndarray,
     trivial_idx: int,
     n_classes: int,
-    n_seeds: int = 30,
+    n_iterations: int = 5,
     epochs: int = 120,
     batch_size: int = 256,
     lr: float = 1e-3,
     patience: int = 15,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Executa o loop de avaliação multi-seed (30 iterações) estritamente sobre o
+    Executa o protocolo 5x2 Cross-Validation (Dietterich / Nadeau-Bengio) estritamente sobre o
     conjunto de Desenvolvimento.
-    MLP, Random Forest e Regressão Logística operam sobre os EXATOS mesmos splits
-    internos (Treino 70% do total / Validação 15% do total) e a mesma padronização.
+    Gera 5 iterações com divisão 50%/50% (treino/validação), invertendo os papéis para gerar
+    10 dobras (folds) controladas para MLP, Random Forest e Regressão Logística.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    n_folds_total = n_iterations * 2
     print(f"\n{'=' * 86}")
-    print(f" EXECUÇÃO DO LOOP MULTI-SEED SIMÉTRICO ({n_seeds} SEMENTES NO DESENVOLVIMENTO)")
-    print(f" Dispositivo: {device} | Holdout Cego mantido 100% isolado em quarentena")
+    print(f" EXECUÇÃO DO PROTOCOLO 5x2 CROSS-VALIDATION ({n_iterations} ITERAÇÕES / {n_folds_total} DOBRAS NO DEV)")
+    print(f" Dispositivo: {device} | Holdout Externo mantido 100% isolado em quarentena")
     print(f"{'=' * 86}")
 
     all_runs: List[Dict[str, Any]] = []
@@ -562,139 +574,180 @@ def run_symmetric_multiseed_evaluation(
     rf_registry: Dict[int, Any] = {}
     lr_registry: Dict[int, Any] = {}
 
-    # Proporção interna de validação: 15% do total / 85% do total = 3/17 ≈ 17.65%
-    val_size_in_dev = 15.0 / 85.0
+    idx_all = np.arange(len(y_dev))
 
-    for seed in range(n_seeds):
-        seed_everything(seed)
-
-        # Divisão interna de Treino / Validação sobre o conjunto de Desenvolvimento
-        X_tr, X_va, y_tr, y_va = train_test_split(
-            X_dev,
-            y_dev,
-            test_size=val_size_in_dev,
-            random_state=seed,
+    for iter_idx in range(n_iterations):
+        # Partição estratificada 50% / 50% para a iteração corrente (Dietterich 5x2 CV)
+        idx_a, idx_b = train_test_split(
+            idx_all,
+            test_size=0.5,
+            random_state=iter_idx,
             stratify=y_dev,
         )
 
-        # Padronização ajustada EXCLUSIVAMENTE sobre o conjunto de treino deste fold
-        scaler = StandardScaler().fit(X_tr)
-        X_tr_s = scaler.transform(X_tr)
-        X_va_s = scaler.transform(X_va)
+        fold_pairs = [
+            (0, idx_a, idx_b),  # Dobra 0 da iteração: Treina em A, Valida em B
+            (1, idx_b, idx_a),  # Dobra 1 da iteração: Treina em B, Valida em A
+        ]
 
-        bin_va = (y_va != trivial_idx).astype(np.int64)
+        for fold_in_iter, tr_idx, va_idx in fold_pairs:
+            fold_id = iter_idx * 2 + fold_in_iter
+            seed_everything(100 + fold_id)
 
-        # ── 1. MLP TOPOLÓGICA ──
-        t0_mlp = time.perf_counter()
-        mlp_res = train_mlp_single_seed(
-            X_tr_s=X_tr_s,
-            y_tr=y_tr,
-            X_va_s=X_va_s,
-            y_va=y_va,
-            n_classes=n_classes,
-            trivial_idx=trivial_idx,
-            device=device,
-            seed=seed,
-            epochs=epochs,
-            batch_size=batch_size,
-            lr=lr,
-            patience=patience,
-        )
-        t_mlp = time.perf_counter() - t0_mlp
+            X_tr, y_tr = X_dev[tr_idx], y_dev[tr_idx]
+            X_va, y_va = X_dev[va_idx], y_dev[va_idx]
 
-        mlp_registry[seed] = {
-            "model": mlp_res["model"],
-            "scaler": scaler,
-            "X_train_scaled": X_tr_s,
-            "threshold": mlp_res["threshold"],
-            "strategy": mlp_res["strategy"],
-            "selection_key": mlp_res["selection_key"],
-            "val_tpr": mlp_res["val_tpr_at_thr"],
-            "val_fpr": mlp_res["val_fpr_at_thr"],
-            "val_f1": mlp_res["val_f1_macro"],
-            "val_loss": mlp_res["val_loss"],
-        }
+            # Padronização ajustada EXCLUSIVAMENTE sobre o conjunto de treino desta dobra
+            scaler = StandardScaler().fit(X_tr)
+            X_tr_s = scaler.transform(X_tr)
+            X_va_s = scaler.transform(X_va)
 
-        all_runs.append({
-            "modelo": "MLP",
-            "seed": seed,
-            "estrategia": mlp_res["strategy"],
-            "limiar": mlp_res["threshold"],
-            "recall_val": mlp_res["val_tpr_at_thr"],
-            "fpr_val": mlp_res["val_fpr_at_thr"],
-            "f1_macro_val": mlp_res["val_f1_macro"],
-            "precision_val": mlp_res["val_precision_at_thr"],
-            "tempo_treino_s": t_mlp,
-        })
+            bin_va = (y_va != trivial_idx).astype(np.int64)
 
-        # ── 2. RANDOM FOREST BALANCEADO ──
-        rf = RandomForestClassifier(
-            n_estimators=300,
-            class_weight="balanced",
-            random_state=seed,
-            n_jobs=-1,
-        )
-        t0_rf = time.perf_counter()
-        rf.fit(X_tr_s, y_tr)
-        t_rf = time.perf_counter() - t0_rf
+            # ── 1. MLP TOPOLÓGICA ──
+            t0_mlp = time.perf_counter()
+            mlp_res = train_mlp_single_seed(
+                X_tr_s=X_tr_s,
+                y_tr=y_tr,
+                X_va_s=X_va_s,
+                y_va=y_va,
+                n_classes=n_classes,
+                trivial_idx=trivial_idx,
+                device=device,
+                seed=100 + fold_id,
+                epochs=epochs,
+                batch_size=batch_size,
+                lr=lr,
+                patience=patience,
+            )
+            t_mlp = time.perf_counter() - t0_mlp
 
-        probs_va_rf = rf.predict_proba(X_va_s)
-        probs_nt_va_rf = 1.0 - probs_va_rf[:, trivial_idx]
-        thr_rf = compute_high_sensitivity_threshold(bin_va, probs_nt_va_rf)
-        pred_va_rf = apply_high_sensitivity_threshold(probs_nt_va_rf, thr_rf)
-        m_rf = binary_confusion_metrics(bin_va, pred_va_rf)
-        f1_rf = precision_recall_fscore_support(
-            y_va, rf.predict(X_va_s), average="macro", zero_division=0
-        )[2]
+            mlp_registry[fold_id] = {
+                "fold_id": fold_id,
+                "iteration": iter_idx,
+                "fold_in_iter": fold_in_iter,
+                "model": mlp_res["model"],
+                "scaler": scaler,
+                "X_train_scaled": X_tr_s,
+                "threshold": mlp_res["threshold"],
+                "strategy": mlp_res["strategy"],
+                "selection_key": mlp_res["selection_key"],
+                "val_tpr": mlp_res["val_tpr_at_thr"],
+                "val_fpr": mlp_res["val_fpr_at_thr"],
+                "val_f1": mlp_res["val_f1_macro"],
+                "val_loss": mlp_res["val_loss"],
+            }
 
-        rf_registry[seed] = {"model": rf, "threshold": thr_rf}
-        all_runs.append({
-            "modelo": "RandomForest",
-            "seed": seed,
-            "estrategia": "balanced",
-            "limiar": thr_rf,
-            "recall_val": m_rf["tpr"],
-            "fpr_val": m_rf["fpr"],
-            "f1_macro_val": float(f1_rf),
-            "precision_val": m_rf["precision"],
-            "tempo_treino_s": t_rf,
-        })
+            all_runs.append({
+                "modelo": "MLP",
+                "iteration": iter_idx,
+                "fold_in_iter": fold_in_iter,
+                "fold_id": fold_id,
+                "seed": fold_id,
+                "estrategia": mlp_res["strategy"],
+                "limiar": mlp_res["threshold"],
+                "recall_val": mlp_res["val_tpr_at_thr"],
+                "fpr_val": mlp_res["val_fpr_at_thr"],
+                "f1_macro_val": mlp_res["val_f1_macro"],
+                "precision_val": mlp_res["val_precision_at_thr"],
+                "tempo_treino_s": t_mlp,
+            })
 
-        # ── 3. REGRESSÃO LOGÍSTICA BALANCEADA ──
-        lr_model = LogisticRegression(
-            max_iter=2000,
-            class_weight="balanced",
-            random_state=seed,
-        )
-        t0_lr = time.perf_counter()
-        lr_model.fit(X_tr_s, y_tr)
-        t_lr = time.perf_counter() - t0_lr
+            # ── 2. RANDOM FOREST BALANCEADO ──
+            rf = RandomForestClassifier(
+                n_estimators=300,
+                class_weight="balanced",
+                random_state=100 + fold_id,
+                n_jobs=-1,
+            )
+            t0_rf = time.perf_counter()
+            rf.fit(X_tr_s, y_tr)
+            t_rf = time.perf_counter() - t0_rf
 
-        probs_va_lr = lr_model.predict_proba(X_va_s)
-        probs_nt_va_lr = 1.0 - probs_va_lr[:, trivial_idx]
-        thr_lr = compute_high_sensitivity_threshold(bin_va, probs_nt_va_lr)
-        pred_va_lr = apply_high_sensitivity_threshold(probs_nt_va_lr, thr_lr)
-        m_lr = binary_confusion_metrics(bin_va, pred_va_lr)
-        f1_lr = precision_recall_fscore_support(
-            y_va, lr_model.predict(X_va_s), average="macro", zero_division=0
-        )[2]
+            probs_va_rf = rf.predict_proba(X_va_s)
+            probs_nt_va_rf = 1.0 - probs_va_rf[:, trivial_idx]
+            thr_rf = compute_high_sensitivity_threshold(bin_va, probs_nt_va_rf)
+            pred_va_rf = apply_high_sensitivity_threshold(probs_nt_va_rf, thr_rf)
+            m_rf = binary_confusion_metrics(bin_va, pred_va_rf)
+            f1_rf = float(precision_recall_fscore_support(
+                y_va, rf.predict(X_va_s), average="macro", zero_division=0
+            )[2])
 
-        lr_registry[seed] = {"model": lr_model, "threshold": thr_lr}
-        all_runs.append({
-            "modelo": "LogisticRegression",
-            "seed": seed,
-            "estrategia": "balanced",
-            "limiar": thr_lr,
-            "recall_val": m_lr["tpr"],
-            "fpr_val": m_lr["fpr"],
-            "f1_macro_val": float(f1_lr),
-            "precision_val": m_lr["precision"],
-            "tempo_treino_s": t_lr,
-        })
+            rf_registry[fold_id] = {
+                "fold_id": fold_id,
+                "iteration": iter_idx,
+                "fold_in_iter": fold_in_iter,
+                "model": rf,
+                "scaler": scaler,
+                "threshold": thr_rf,
+                "selection_key": (m_rf["tpr"], -m_rf["fpr"], f1_rf),
+                "val_tpr": m_rf["tpr"],
+                "val_fpr": m_rf["fpr"],
+                "val_f1": f1_rf,
+            }
+            all_runs.append({
+                "modelo": "RandomForest",
+                "iteration": iter_idx,
+                "fold_in_iter": fold_in_iter,
+                "fold_id": fold_id,
+                "seed": fold_id,
+                "estrategia": "balanced",
+                "limiar": thr_rf,
+                "recall_val": m_rf["tpr"],
+                "fpr_val": m_rf["fpr"],
+                "f1_macro_val": f1_rf,
+                "precision_val": m_rf["precision"],
+                "tempo_treino_s": t_rf,
+            })
 
-        if (seed + 1) % 5 == 0 or seed == 0:
+            # ── 3. REGRESSÃO LOGÍSTICA BALANCEADA ──
+            lr_model = LogisticRegression(
+                max_iter=2000,
+                class_weight="balanced",
+                random_state=100 + fold_id,
+            )
+            t0_lr = time.perf_counter()
+            lr_model.fit(X_tr_s, y_tr)
+            t_lr = time.perf_counter() - t0_lr
+
+            probs_va_lr = lr_model.predict_proba(X_va_s)
+            probs_nt_va_lr = 1.0 - probs_va_lr[:, trivial_idx]
+            thr_lr = compute_high_sensitivity_threshold(bin_va, probs_nt_va_lr)
+            pred_va_lr = apply_high_sensitivity_threshold(probs_nt_va_lr, thr_lr)
+            m_lr = binary_confusion_metrics(bin_va, pred_va_lr)
+            f1_lr = float(precision_recall_fscore_support(
+                y_va, lr_model.predict(X_va_s), average="macro", zero_division=0
+            )[2])
+
+            lr_registry[fold_id] = {
+                "fold_id": fold_id,
+                "iteration": iter_idx,
+                "fold_in_iter": fold_in_iter,
+                "model": lr_model,
+                "scaler": scaler,
+                "threshold": thr_lr,
+                "selection_key": (m_lr["tpr"], -m_lr["fpr"], f1_lr),
+                "val_tpr": m_lr["tpr"],
+                "val_fpr": m_lr["fpr"],
+                "val_f1": f1_lr,
+            }
+            all_runs.append({
+                "modelo": "LogisticRegression",
+                "iteration": iter_idx,
+                "fold_in_iter": fold_in_iter,
+                "fold_id": fold_id,
+                "seed": fold_id,
+                "estrategia": "balanced",
+                "limiar": thr_lr,
+                "recall_val": m_lr["tpr"],
+                "fpr_val": m_lr["fpr"],
+                "f1_macro_val": f1_lr,
+                "precision_val": m_lr["precision"],
+                "tempo_treino_s": t_lr,
+            })
+
             print(
-                f"  [Semente {seed:>2}/{n_seeds - 1}] "
+                f"  [5x2 CV Iter {iter_idx + 1}/5, Dobra {fold_in_iter + 1}/2 (ID {fold_id})] "
                 f"MLP (FPR_val={mlp_res['val_fpr_at_thr']:.4f}, F1={mlp_res['val_f1_macro']:.4f}) | "
                 f"RF (FPR_val={m_rf['fpr']:.4f}) | LR (FPR_val={m_lr['fpr']:.4f})"
             )
@@ -709,7 +762,7 @@ def run_symmetric_multiseed_evaluation(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MÓDULO 7 — SELEÇÃO DO MODELO DE PRODUÇÃO E AVALIAÇÃO NO HOLDOUT CEGO
+# MÓDULO 7 — SELEÇÃO DO MODELO DE PRODUÇÃO E AVALIAÇÃO NO HOLDOUT EXTERNO
 # ══════════════════════════════════════════════════════════════════════════════
 
 def evaluate_production_on_blind_holdout(
@@ -723,23 +776,23 @@ def evaluate_production_on_blind_holdout(
 ) -> Dict[str, Any]:
     """
     Executa o teste de avaliação exatamente 1 (uma) única vez sobre o conjunto
-    Holdout Cego (15%) após o congelamento estrito do modelo de produção, do
+    Holdout Externo (15%) após o congelamento estrito do modelo de produção, do
     scaler e do limiar heurístico.
     """
     print(f"\n{'=' * 86}")
-    print(" AVALIAÇÃO NO CONJUNTO HOLDOUT CEGO EXTERNO (15% — TOCADO UMA ÚNICA VEZ)")
+    print(" AVALIAÇÃO NO CONJUNTO HOLDOUT EXTERNO (15% — ISOLAMENTO OUT-OF-SAMPLE ESTRITO)")
     print(f"{'=' * 86}")
 
     scaler: StandardScaler = production_candidate["scaler"]
     mlp_model: nn.Module = production_candidate["model"]
     mlp_threshold: float = production_candidate["threshold"]
 
-    # Padronização do Holdout Cego com o scaler congelado do treino
-    X_holdout_s = scaler.transform(X_holdout)
+    # Padronização do Holdout Externo com o scaler congelado do treino da MLP
+    X_holdout_s_mlp = scaler.transform(X_holdout)
     bin_holdout = (y_holdout != trivial_idx).astype(np.int64)
 
     # ── Avaliação da MLP ──
-    ho_loader = DataLoader(ChernDataset(X_holdout_s, y_holdout), batch_size=512, shuffle=False)
+    ho_loader = DataLoader(ChernDataset(X_holdout_s_mlp, y_holdout), batch_size=512, shuffle=False)
     ho_eval = evaluate_model(mlp_model, ho_loader, device, trivial_idx, criterion=None)
 
     mlp_ho_pred_at_thr = apply_high_sensitivity_threshold(ho_eval["probs_nt"], mlp_threshold)
@@ -751,10 +804,12 @@ def evaluate_production_on_blind_holdout(
         alpha=0.05,
     )
 
-    # ── Avaliação dos Baselines Congelados no Holdout ──
+    # ── Avaliação dos Baselines Congelados no Holdout (com seus scalers independentes) ──
     rf_model = baselines_production["rf"]["model"]
     rf_threshold = baselines_production["rf"]["threshold"]
-    probs_ho_rf = rf_model.predict_proba(X_holdout_s)
+    rf_scaler: StandardScaler = baselines_production["rf"].get("scaler", scaler)
+    X_holdout_s_rf = rf_scaler.transform(X_holdout)
+    probs_ho_rf = rf_model.predict_proba(X_holdout_s_rf)
     probs_nt_ho_rf = 1.0 - probs_ho_rf[:, trivial_idx]
     rf_ho_pred = apply_high_sensitivity_threshold(probs_nt_ho_rf, rf_threshold)
     rf_ho_metrics = binary_confusion_metrics(bin_holdout, rf_ho_pred)
@@ -764,7 +819,9 @@ def evaluate_production_on_blind_holdout(
 
     lr_model = baselines_production["lr"]["model"]
     lr_threshold = baselines_production["lr"]["threshold"]
-    probs_ho_lr = lr_model.predict_proba(X_holdout_s)
+    lr_scaler: StandardScaler = baselines_production["lr"].get("scaler", scaler)
+    X_holdout_s_lr = lr_scaler.transform(X_holdout)
+    probs_ho_lr = lr_model.predict_proba(X_holdout_s_lr)
     probs_nt_ho_lr = 1.0 - probs_ho_lr[:, trivial_idx]
     lr_ho_pred = apply_high_sensitivity_threshold(probs_nt_ho_lr, lr_threshold)
     lr_ho_metrics = binary_confusion_metrics(bin_holdout, lr_ho_pred)
@@ -772,7 +829,7 @@ def evaluate_production_on_blind_holdout(
         k=lr_ho_metrics["tp"], n=lr_ho_metrics["tp"] + lr_ho_metrics["fn"], alpha=0.05
     )
 
-    print("\n--- DESEMPENHO NO HOLDOUT CEGO EXTERNO (N = %d amostras, %d não-triviais) ---"
+    print("\n--- DESEMPENHO NO HOLDOUT EXTERNO (N = %d amostras, %d não-triviais) ---"
           % (len(y_holdout), int(bin_holdout.sum())))
 
     holdout_table = [
@@ -812,6 +869,7 @@ def evaluate_production_on_blind_holdout(
         classification_report(
             ho_eval["targets"],
             ho_eval["preds"],
+            labels=list(range(len(classes))),
             target_names=[str(c) for c in classes],
             zero_division=0,
         )
@@ -823,7 +881,7 @@ def evaluate_production_on_blind_holdout(
         "mlp_f1_macro": ho_eval["f1_macro"],
         "rf_metrics": rf_ho_metrics,
         "lr_metrics": lr_ho_metrics,
-        "X_holdout_scaled": X_holdout_s,
+        "X_holdout_scaled": X_holdout_s_mlp,
     }
 
 
@@ -836,7 +894,7 @@ def bayesian_precision_projection(
 ) -> Dict[str, float]:
     """
     Projeta o Valor Preditivo Positivo (Precisão) em condições de distribuição
-    natural via Teorema de Bayes utilizando a prevalência física real (pi).
+    sob prior uniforme prescrito via Teorema de Bayes utilizando a prevalência (pi).
     """
     pi = real_prevalence
     numerator = test_tpr * pi
@@ -849,12 +907,12 @@ def bayesian_precision_projection(
     print(f"\n{'=' * 86}")
     print(" PROJEÇÃO BAYESIANA DE PRECISÃO EM DEPLOYMENT REAL (π Dinâmico)")
     print(f"{'=' * 86}")
-    print(f" Prevalência física real medida do oráculo FHS (π): {pi:.4%}")
-    print(f" Sensibilidade / Recall medido no Holdout Cego:    {test_tpr:.4%}")
-    print(f" Taxa de Falsos Positivos (FPR) no Holdout Cego:   {test_fpr:.4%}")
+    print(f" Prevalência de Evento Raro induzida pelo prior uniforme de amostragem prescrito (π, calculada em Dev): {pi:.4%}")
+    print(f" Sensibilidade / Recall medido no Holdout Externo:  {test_tpr:.4%}")
+    print(f" Taxa de Falsos Positivos (FPR) no Holdout Externo: {test_fpr:.4%}")
     print(f" ----------------------------------------------------------------------------------")
     print(f" Precisão em cenário artificialmente balanceado (π = 0.50): {precision_5050:.4%}")
-    print(f" Precisão Projetada no espaço físico contínuo (π = {pi:.2%}):     {projected_precision:.4%}")
+    print(f" Precisão Projetada no espaço contínuo (π = {pi:.2%}):             {projected_precision:.4%}")
     print(f" ----------------------------------------------------------------------------------")
 
     return {
@@ -985,128 +1043,12 @@ def batch_predict_with_domain_guard(
     }
 
 
-def empirical_hybrid_pipeline(
-    model: nn.Module,
-    scaler: StandardScaler,
-    trivial_idx: int,
-    threshold: float,
-    X_train_scaled: np.ndarray,
-    n_eval: int = 100_000,
-    fhs_calibration_sample: int = 40,
-    fhs_full_audit: bool = False,
-    maha_percentile: float = 99.5,
-    seed: int = 7,
-) -> Optional[Dict[str, Any]]:
-    """
-    Avaliação empírica do pipeline híbrido (MLP como filtro de triagem + Oráculo FHS
-    como auditor de alta fidelidade) em 10^5 pontos reais amostrados no espaço de parâmetros.
-    """
-    rng = np.random.default_rng(seed)
-    device = next(model.parameters()).device
-    model.eval()
-
-    print(f"\n{'=' * 86}")
-    print(" PIPELINE HÍBRIDO — AVALIAÇÃO EMPÍRICA EM 10^5 PONTOS REAIS COM GUARDA OOD")
-    print(f"{'=' * 86}")
-
-    guard = TopoDomainGuard(
-        bounds=_BOUNDS,
-        scaler=scaler,
-        X_train_scaled=X_train_scaled,
-        maha_percentile=maha_percentile,
-        epsilon=1e-6,
-    )
-
-    # ── Experimento A: Robustez Adversarial OOD (BBox + Covariate Shift no BBox) ──
-    n_adv = 10_000
-    n_adv_in_bbox_shift = 5_000
-    n_adv_out_bbox = 5_000
-
-    # 1. Pontos fora do Bounding Box físico
-    features_out = []
-    for feat in FEATURES:
-        lo, hi = _BOUNDS[feat]
-        span = hi - lo
-        side = rng.choice([0, 1], size=n_adv_out_bbox)
-        val_out_low = rng.uniform(lo - 0.25 * span, lo, size=n_adv_out_bbox)
-        val_out_high = rng.uniform(hi, hi + 0.25 * span, size=n_adv_out_bbox)
-        features_out.append(np.where(side == 0, val_out_low, val_out_high))
-    X_adv_out = np.stack(features_out, axis=1).astype(np.float32)
-
-    # 2. Pontos DENTRO do Bounding Box, mas com Covariate Shift / correlação anômala não vista
-    #    (amostrados nos vértices e cantos do hipercubo onde a densidade espectral é anômala)
-    M_lo, M_hi = _BOUNDS["M"]
-    p_lo, p_hi = -1.0, 1.0
-    corner_M = rng.choice([M_lo + 0.01, M_hi - 0.01], size=n_adv_in_bbox_shift)
-    corner_p2 = rng.choice([p_lo + 0.01, p_hi - 0.01], size=n_adv_in_bbox_shift)
-    corner_p3 = rng.choice([p_lo + 0.01, p_hi - 0.01], size=n_adv_in_bbox_shift)
-    corner_p4 = rng.choice([p_lo + 0.01, p_hi - 0.01], size=n_adv_in_bbox_shift)
-    noise = rng.normal(0, 0.02, size=(n_adv_in_bbox_shift, 4))
-    X_adv_in = np.stack([corner_M, corner_p2, corner_p3, corner_p4], axis=1).astype(np.float32) + noise
-    # Garante que X_adv_in permaneça estritamente dentro do BBox para testar Mahalanobis
-    for j, feat in enumerate(FEATURES):
-        lo, hi = _BOUNDS[feat]
-        X_adv_in[:, j] = np.clip(X_adv_in[:, j], lo + 1e-4, hi - 1e-4)
-
-    X_adv = np.vstack([X_adv_out, X_adv_in])
-    rng.shuffle(X_adv)
-
-    gate_adv = guard.check(X_adv)
-    n_adv_ood = int((~gate_adv["trusted"]).sum())
-    n_adv_bbox = int((~gate_adv["in_bbox"]).sum())
-    n_adv_maha = int((~gate_adv["in_density"]).sum())
-
-    print(f"\n [EXPERIMENTO A: Robustez OOD — Lote Adversarial 10k pts]")
-    print(f" Pontos OOD Interceptados: {n_adv_ood:,} ({n_adv_ood / n_adv:.1%})")
-    print(f"   -> Barrados por Limites Físicos (BBox): {n_adv_bbox:,}")
-    print(f"   -> Barrados por Densidade Espectral (Mahalanobis p{maha_percentile:g}): {n_adv_maha:,}")
-
-    # ── Experimento B: Eficiência Operacional em Lote Limpo ──
-    features_list_clean = []
-    for feat in FEATURES:
-        lo, hi = _BOUNDS[feat]
-        features_list_clean.append(rng.uniform(lo, hi, n_eval))
-
-    X_clean = np.stack(features_list_clean, axis=1).astype(np.float32)
-    M_clean = X_clean[:, 0]
-    p2_clean = X_clean[:, 1]
-    p3_clean = X_clean[:, 2]
-    p4_clean = X_clean[:, 3]
-    X_clean_s = scaler.transform(X_clean).astype(np.float32)
-
-    X_tensor = torch.from_numpy(X_clean_s).to(device)
-    with torch.no_grad():
-        t0 = time.perf_counter()
-        logits = model(X_tensor)
-        probs = torch.softmax(logits, dim=-1)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t_mlp_total = time.perf_counter() - t0
-
-    probs_nt = (1.0 - probs[:, trivial_idx]).cpu().numpy()
-    t_mlp_ms_per_point = (t_mlp_total / n_eval) * 1000.0
-
-    routing_clean = guard.route_inference(X_clean, probs_nt, threshold=threshold)
-    flagged_mask_clean = routing_clean["flagged_for_oracle"]
-
-    flagged_idx = np.where(flagged_mask_clean)[0]
-    unflagged_idx = np.where(~flagged_mask_clean)[0]
-
-    n_flagged = int(len(flagged_idx))
-    n_unflagged = int(len(unflagged_idx))
-    oracle_reduction_pct = routing_clean["oracle_reduction_pct"]
-
-    print(f"\n [EXPERIMENTO B: Eficiência em Produção — Lote de {n_eval // 1000}k pts]")
-    print(f" Tempo total forward pass MLP: {t_mlp_total * 1000:.2f} ms ({t_mlp_ms_per_point:.6f} ms/pt)")
-    print(f" Pontos sinalizados para auditoria FHS: {n_flagged:,} ({n_flagged / n_eval:.2%})")
-    print(f" [MÉTRICA PRIMÁRIA] Redução de Chamadas ao Oráculo FHS: {oracle_reduction_pct:.2f}%")
-
 def measure_stratified_fhs_speedup(
     X_clean: np.ndarray,
     flagged_idx: np.ndarray,
     unflagged_idx: np.ndarray,
-    t_mlp_total_sec: float,
-    k_sample: int = 40,
+    t_screening_total_sec: float,
+    k_sample: int = 1000,
     rng: Optional[np.random.Generator] = None,
     n_bootstrap: int = 1000,
     fhs_full_audit: bool = False,
@@ -1114,21 +1056,13 @@ def measure_stratified_fhs_speedup(
     """
     Benchmark Estratificado de Eficiência Computacional via Amostragem Dupla Independente.
 
-    Resolve a falha metodológica de latência uniforme do Oráculo FHS:
-      1. Separação de Populações Disjuntas:
-         - Flagged (Crítica): Amostras enviadas para o FHS (fechamento de gap /
-           fluxo de Berry concentrado que acionam refinamento N=60 -> N=120).
-         - Unflagged (Trivial): Amostras no bulk onde a malha grosseira N=60 converge.
-      2. Amostragem Estocástica Estratificada:
-         - Sorteio determinístico sem reposição de k amostras independentes por estrato.
-      3. Medição Independente de Latência com precisão de nanossegundos (time.perf_counter):
-         - t_fhs_flagged (média e desvio padrão em segundos)
-         - t_fhs_unflagged (média e desvio padrão em segundos)
-      4. Cálculo do Speedup Despoluído e Ponderado:
-         - T_pure_fhs = (N_flagged * t_fhs_flagged) + (N_unflagged * t_fhs_unflagged)
-         - T_hybrid = T_mlp_total + (N_flagged * t_fhs_flagged)
-         - Speedup = T_pure_fhs / T_hybrid
-      5. Incerteza Estatística via Bootstrap (IC 95% bicaudal).
+    Mitiga Thermal Throttling, Clock Jitter e Viés de Cache através de Intercalação Estocástica:
+      1. Seleciona subamostras de calibração k_1 e k_2 para os estratos Flagged e Unflagged.
+      2. Cria uma lista unificada de tarefas rotuladas [(idx, True), ..., (idx, False)] e aplica rng.shuffle().
+      3. Executa o loop do oráculo FHS (compute_chern_rigorous) medindo cada latência individual via time.perf_counter().
+      4. Separa os tempos nas listas latencies_flagged e latencies_unflagged, calculando médias aritméticas em ms.
+      5. Computa T_pure_fhs (projetado) e T_hybrid (projetado com overhead End-to-End de screening), derivando o Speedup.
+      6. Avalia intervalos de incerteza via Bootstrap Não-Paramétrico (IC 95%).
     """
     if rng is None:
         rng = np.random.default_rng(42)
@@ -1142,43 +1076,46 @@ def measure_stratified_fhs_speedup(
     p3_clean = X_clean[:, 2]
     p4_clean = X_clean[:, 3]
 
-    # ── 1. Amostragem e Cronometragem da População Flagged (Crítica) ──
+    # ── 1. Amostragem Estratificada e Intercalação Estocástica de Tarefas ──
     k1 = min(k_sample, n_flagged) if not fhs_full_audit else n_flagged
     sample_flagged_idx = rng.choice(flagged_idx, size=k1, replace=False) if not fhs_full_audit else flagged_idx
 
-    latencies_flagged: List[float] = []
-    fhs_flagged_labels: List[Optional[int]] = []
-
-    for i in sample_flagged_idx:
-        t0 = time.perf_counter()
-        c = compute_chern_rigorous(
-            float(M_clean[i]), float(p2_clean[i]), float(p3_clean[i]), float(p4_clean[i]), N_init=60, n_occ=3
-        )
-        dt = time.perf_counter() - t0
-        latencies_flagged.append(dt)
-        fhs_flagged_labels.append(c)
-
-    arr_lat_flagged = np.array(latencies_flagged, dtype=np.float64)
-    t_fhs_flagged_mean_s = float(np.mean(arr_lat_flagged))
-    t_fhs_flagged_std_s = float(np.std(arr_lat_flagged, ddof=1)) if len(arr_lat_flagged) > 1 else 0.0
-
-    # ── 2. Amostragem e Cronometragem da População Unflagged (Trivial / Segura) ──
     if n_unflagged > 0:
         k2 = min(k_sample, n_unflagged) if not fhs_full_audit else n_unflagged
         sample_unflagged_idx = rng.choice(unflagged_idx, size=k2, replace=False) if not fhs_full_audit else unflagged_idx
+    else:
+        k2 = 0
+        sample_unflagged_idx = np.array([], dtype=int)
 
-        latencies_unflagged: List[float] = []
-        fhs_unflagged_labels: List[Optional[int]] = []
+    # Lista unificada de tarefas estocasticamente intercaladas para prevenir thermal throttling
+    tasks = [(int(idx), True) for idx in sample_flagged_idx] + [(int(idx), False) for idx in sample_unflagged_idx]
+    rng.shuffle(tasks)
 
-        for i in sample_unflagged_idx:
-            t0 = time.perf_counter()
-            c = compute_chern_rigorous(
-                float(M_clean[i]), float(p2_clean[i]), float(p3_clean[i]), float(p4_clean[i]), N_init=60, n_occ=3
-            )
-            dt = time.perf_counter() - t0
+    # ── 2. Execução Intercalada com Cronometragem Individual ──
+    latencies_flagged: List[float] = []
+    latencies_unflagged: List[float] = []
+    fhs_flagged_labels: List[Optional[int]] = []
+    fhs_unflagged_labels: List[Optional[int]] = []
+
+    for idx, is_flagged in tasks:
+        t0 = time.perf_counter()
+        c = compute_chern_rigorous(
+            float(M_clean[idx]), float(p2_clean[idx]), float(p3_clean[idx]), float(p4_clean[idx]),
+            N_init=60, n_occ=3
+        )
+        dt = time.perf_counter() - t0
+        if is_flagged:
+            latencies_flagged.append(dt)
+            fhs_flagged_labels.append(c)
+        else:
             latencies_unflagged.append(dt)
             fhs_unflagged_labels.append(c)
 
+    arr_lat_flagged = np.array(latencies_flagged, dtype=np.float64)
+    t_fhs_flagged_mean_s = float(np.mean(arr_lat_flagged)) if len(arr_lat_flagged) > 0 else 0.0
+    t_fhs_flagged_std_s = float(np.std(arr_lat_flagged, ddof=1)) if len(arr_lat_flagged) > 1 else 0.0
+
+    if len(latencies_unflagged) > 0:
         arr_lat_unflagged = np.array(latencies_unflagged, dtype=np.float64)
         t_fhs_unflagged_mean_s = float(np.mean(arr_lat_unflagged))
         t_fhs_unflagged_std_s = float(np.std(arr_lat_unflagged, ddof=1)) if len(arr_lat_unflagged) > 1 else 0.0
@@ -1187,13 +1124,15 @@ def measure_stratified_fhs_speedup(
         t_fhs_unflagged_mean_s = t_fhs_flagged_mean_s
         t_fhs_unflagged_std_s = t_fhs_flagged_std_s
 
+    t_fhs_flagged_ms = t_fhs_flagged_mean_s * 1000.0
+    t_fhs_unflagged_ms = t_fhs_unflagged_mean_s * 1000.0
     latency_ratio = t_fhs_flagged_mean_s / t_fhs_unflagged_mean_s if t_fhs_unflagged_mean_s > 0 else 1.0
 
     # ── 3. Projeção Despoluída de Custos Totais e Speedup Realista ──
     t_fhs_audit_flagged_total_s = n_flagged * t_fhs_flagged_mean_s
     t_fhs_unflagged_pure_total_s = n_unflagged * t_fhs_unflagged_mean_s
     t_pure_fhs_total_s = t_fhs_audit_flagged_total_s + t_fhs_unflagged_pure_total_s
-    t_hybrid_total_s = t_mlp_total_sec + t_fhs_audit_flagged_total_s
+    t_hybrid_total_s = t_screening_total_sec + t_fhs_audit_flagged_total_s
     speedup = t_pure_fhs_total_s / t_hybrid_total_s if t_hybrid_total_s > 0 else float("inf")
 
     # ── 4. Incerteza Estatística via Bootstrap Não-Paramétrico (IC 95%) ──
@@ -1205,16 +1144,16 @@ def measure_stratified_fhs_speedup(
         m_f = float(np.mean(b_f))
         m_u = float(np.mean(b_u))
         b_pure = (n_flagged * m_f) + (n_unflagged * m_u)
-        b_hyb = t_mlp_total_sec + (n_flagged * m_f)
+        b_hyb = t_screening_total_sec + (n_flagged * m_f)
         boot_speedups.append(b_pure / b_hyb if b_hyb > 0 else 0.0)
         boot_ratios.append(m_f / m_u if m_u > 0 else 1.0)
 
     ci_speedup = (float(np.percentile(boot_speedups, 2.5)), float(np.percentile(boot_speedups, 97.5)))
     ci_ratio = (float(np.percentile(boot_ratios, 2.5)), float(np.percentile(boot_ratios, 97.5)))
 
-    frac_nontrivial_in_flagged = float(np.mean([c is not None and c != 0 for c in fhs_flagged_labels]))
+    frac_nontrivial_in_flagged = float(np.mean([c is not None and c != 0 for c in fhs_flagged_labels])) if fhs_flagged_labels else 0.0
 
-    # ── 5. Relatório Formatado de Auditoria HPC ──
+    # ── 5. Relatório Formatado de Auditoria HPC com Rigor de Nomenclatura ──
     print(f"\n{'=' * 86}")
     print(" BENCHMARK ESTRATIFICADO DE EFICIÊNCIA COMPUTACIONAL (AMOSTRAGEM DUPLA HPC)")
     print(f"{'=' * 86}")
@@ -1222,21 +1161,21 @@ def measure_stratified_fhs_speedup(
     print(f" População Flagged (Encaminhada ao Oráculo):   {n_flagged:,} pontos ({n_flagged / n_total:.2%})")
     print(f" População Unflagged (Filtrada pela MLP):      {n_unflagged:,} pontos ({n_unflagged / n_total:.2%})")
     print(f" ----------------------------------------------------------------------------------")
-    print(f" [AMOSTRAGEM DUPLA INDEPENDENTE DE LATÊNCIA (k_flagged={k1}, k_unflagged={k2 if n_unflagged > 0 else 0})]")
-    print(f" • Latência FHS Flagged (t_fhs_flagged):         {t_fhs_flagged_mean_s * 1000:.3f} ± {t_fhs_flagged_std_s * 1000:.3f} ms/pt")
-    print(f" • Latência FHS Unflagged (t_fhs_unflagged):     {t_fhs_unflagged_mean_s * 1000:.3f} ± {t_fhs_unflagged_std_s * 1000:.3f} ms/pt")
+    print(f" [AMOSTRAGEM DUPLA INTERCALADA ESTOCASTICAMENTE (k_flagged={k1}, k_unflagged={k2})]")
+    print(f" • Latência Média FHS Flagged (t_fhs_flagged):     {t_fhs_flagged_ms:.3f} ± {t_fhs_flagged_std_s * 1000:.3f} ms/pt")
+    print(f" • Latência Média FHS Unflagged (t_fhs_unflagged): {t_fhs_unflagged_ms:.3f} ± {t_fhs_unflagged_std_s * 1000:.3f} ms/pt")
     print(f" • Razão de Latência (Flagged / Unflagged):      {latency_ratio:.2f}x (IC 95%: [{ci_ratio[0]:.2f}x, {ci_ratio[1]:.2f}x])")
     print(f" ----------------------------------------------------------------------------------")
     print(f" [CUSTOS DE TEMPO DE PAREDE PROJETADOS (Wall-Clock Time)]")
-    print(f" • Tempo Forward Pass MLP Total:               {t_mlp_total_sec * 1000:.2f} ms ({t_mlp_total_sec / n_total * 1000:.6f} ms/pt)")
-    print(f" • Custo Oráculo FHS Puro (T_pure_fhs):         {t_pure_fhs_total_s:.2f} s ({t_pure_fhs_total_s / 60:.2f} min)")
+    print(f" • Tempo Screening Pipeline (End-to-End Total):{t_screening_total_sec * 1000:.2f} ms ({t_screening_total_sec / n_total * 1000:.6f} ms/pt)")
+    print(f" • Custo Oráculo FHS Puro Projetado (T_pure):  {t_pure_fhs_total_s:.2f} s ({t_pure_fhs_total_s / 60:.2f} min)")
     print(f"     -> Parcela Flagged ({n_flagged:,} pts):           {t_fhs_audit_flagged_total_s:.2f} s ({t_fhs_audit_flagged_total_s / t_pure_fhs_total_s:.1%})")
     print(f"     -> Parcela Unflagged ({n_unflagged:,} pts):       {t_fhs_unflagged_pure_total_s:.2f} s ({t_fhs_unflagged_pure_total_s / t_pure_fhs_total_s:.1%})")
-    print(f" • Custo Pipeline Híbrido (T_hybrid):           {t_hybrid_total_s:.2f} s ({t_hybrid_total_s / 60:.2f} min)")
+    print(f" • Custo Pipeline Híbrido Estimado (Estrat.):  {t_hybrid_total_s:.2f} s ({t_hybrid_total_s / 60:.2f} min)")
     print(f" ----------------------------------------------------------------------------------")
     print(f" [MÉTRICAS FINAIS DE GANHO DE DESEMPENHO]")
     print(f" • Redução de Chamadas ao Oráculo:             {(1.0 - n_flagged / n_total) * 100.0:.2f}%")
-    print(f" • Speedup de Parede Medido (Despoluído):      {speedup:.2f}x (IC 95%: [{ci_speedup[0]:.2f}x, {ci_speedup[1]:.2f}x])")
+    print(f" • Speedup de Parede Estimado (Estratificado): {speedup:.2f}x (IC 95%: [{ci_speedup[0]:.2f}x, {ci_speedup[1]:.2f}x])")
     print(f" • Confirmação de Fases Cn!=0 na Amostra:       {frac_nontrivial_in_flagged:.2%}")
     print(f"{'=' * 86}\n")
 
@@ -1245,13 +1184,14 @@ def measure_stratified_fhs_speedup(
         "n_flagged": n_flagged,
         "n_unflagged": n_unflagged,
         "oracle_reduction_pct": (1.0 - n_flagged / n_total) * 100.0,
-        "t_fhs_flagged_ms": t_fhs_flagged_mean_s * 1000.0,
-        "t_fhs_unflagged_ms": t_fhs_unflagged_mean_s * 1000.0,
+        "t_fhs_flagged_ms": t_fhs_flagged_ms,
+        "t_fhs_unflagged_ms": t_fhs_unflagged_ms,
         "latency_ratio": latency_ratio,
         "latency_ratio_ci95": ci_ratio,
+        "speedup_stratified_estimated": speedup,
         "speedup_measured": speedup,
         "speedup_ci95": ci_speedup,
-        "t_mlp_total_s": t_mlp_total_sec,
+        "t_screening_total_s": t_screening_total_sec,
         "t_hybrid_total_s": t_hybrid_total_s,
         "t_pure_fhs_total_s": t_pure_fhs_total_s,
         "frac_nontrivial_in_sample": frac_nontrivial_in_flagged,
@@ -1265,7 +1205,7 @@ def empirical_hybrid_pipeline(
     threshold: float,
     X_train_scaled: np.ndarray,
     n_eval: int = 100_000,
-    fhs_calibration_sample: int = 40,
+    fhs_calibration_sample: int = 1000,
     fhs_full_audit: bool = False,
     maha_percentile: float = 99.5,
     seed: int = 7,
@@ -1341,16 +1281,17 @@ def empirical_hybrid_pipeline(
         features_list_clean.append(rng.uniform(lo, hi, n_eval))
 
     X_clean = np.stack(features_list_clean, axis=1).astype(np.float32)
+
+    # CRONOMETRAGEM END-TO-END (Inicia antes do scaler e para após criação das máscaras e vetores de índices)
+    t0_screening = time.perf_counter()
     X_clean_s = scaler.transform(X_clean).astype(np.float32)
 
     X_tensor = torch.from_numpy(X_clean_s).to(device)
     with torch.no_grad():
-        t0 = time.perf_counter()
         logits = model(X_tensor)
         probs = torch.softmax(logits, dim=-1)
         if device.type == "cuda":
             torch.cuda.synchronize()
-        t_mlp_total = time.perf_counter() - t0
 
     probs_nt = (1.0 - probs[:, trivial_idx]).cpu().numpy()
     routing_clean = guard.route_inference(X_clean, probs_nt, threshold=threshold)
@@ -1358,16 +1299,27 @@ def empirical_hybrid_pipeline(
 
     flagged_idx = np.where(flagged_mask_clean)[0]
     unflagged_idx = np.where(~flagged_mask_clean)[0]
+    t_screening_total_s = time.perf_counter() - t0_screening
 
-    if len(flagged_idx) == 0:
+    n_flagged = int(len(flagged_idx))
+    n_unflagged = int(len(unflagged_idx))
+    oracle_reduction_pct = routing_clean["oracle_reduction_pct"]
+    t_screening_ms_per_point = (t_screening_total_s / n_eval) * 1000.0
+
+    print(f"\n [EXPERIMENTO B: Eficiência em Produção — Lote de {n_eval // 1000}k pts]")
+    print(f" Tempo total screening pipeline (End-to-End): {t_screening_total_s * 1000:.2f} ms ({t_screening_ms_per_point:.6f} ms/pt)")
+    print(f" Pontos sinalizados para auditoria FHS: {n_flagged:,} ({n_flagged / n_eval:.2%})")
+    print(f" [MÉTRICA PRIMÁRIA] Redução de Chamadas ao Oráculo FHS: {oracle_reduction_pct:.2f}%")
+
+    if n_flagged == 0:
         return None
 
-    # Benchmark Estratificado com Amostragem Dupla Independente
+    # Benchmark Estratificado com Amostragem Dupla Independente e Intercalação Estocástica
     strat_report = measure_stratified_fhs_speedup(
         X_clean=X_clean,
         flagged_idx=flagged_idx,
         unflagged_idx=unflagged_idx,
-        t_mlp_total_sec=t_mlp_total,
+        t_screening_total_sec=t_screening_total_s,
         k_sample=fhs_calibration_sample,
         rng=rng,
         n_bootstrap=1000,
@@ -1378,7 +1330,7 @@ def empirical_hybrid_pipeline(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# EXECUÇÃO PRINCIPAL (ORQUESTRADOR DO PIPELINE DOUBLE-BLIND)
+# EXECUÇÃO PRINCIPAL (ORQUESTRADOR DO PIPELINE COM ISOLAMENTO ESTRITO)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
@@ -1387,15 +1339,8 @@ def main() -> None:
             f"Dataset {CSV_PATH} não encontrado. Execute data_generator.py para gerar a base física."
         )
 
-    # 1. CARREGAMENTO E LEITURA DA PREVALÊNCIA FÍSICA REAL
+    # 1. CARREGAMENTO DO DATASET
     df_raw = pd.read_csv(CSV_PATH)
-    real_prevalence = float((df_raw["chern"] != 0).mean())
-    print(f"\n{'=' * 86}")
-    print(" INICIALIZAÇÃO DO PIPELINE DE AVALIAÇÃO DOUBLE-BLIND QUALIS A1")
-    print(f"{'=' * 86}")
-    print(f" Dataset carregado: {CSV_PATH} ({len(df_raw)} amostras)")
-    print(f" Prevalência física natural de fases não-triviais (π): {real_prevalence:.4%}")
-
     X_raw = df_raw[FEATURES].values.astype(np.float32)
     y_raw = df_raw["chern"].values
 
@@ -1405,8 +1350,8 @@ def main() -> None:
     n_classes = len(classes)
     trivial_idx = int(np.where(classes == 0)[0][0])
 
-    # 2. ESPECIFICAÇÃO 1: ISOLAMENTO ABSOLUTO DO HOLDOUT EXTERNO (85% Dev / 15% Holdout Cego)
-    # Corte inicial com semente global fixa. O Holdout Cego é colocado em quarentena.
+    # 2. ISOLAMENTO OUT-OF-SAMPLE ESTRITO DO HOLDOUT EXTERNO (85% Dev / 15% Holdout)
+    # O Holdout Externo é colocado em quarentena estrita antes de qualquer estimativa estatística.
     X_dev, X_holdout, y_dev, y_holdout = train_test_split(
         X_raw,
         y,
@@ -1414,46 +1359,71 @@ def main() -> None:
         random_state=GLOBAL_HOLDOUT_SEED,
         stratify=y,
     )
-    print(f"\n Particionamento Inicial de Isolamento Metodológico (Seed Global = {GLOBAL_HOLDOUT_SEED}):")
-    print(f"   -> Conjunto de Desenvolvimento (85%): {len(y_dev):>5} amostras (opera loop multi-seed e calibrações)")
-    print(f"   -> Conjunto Holdout Cego Externo (15%): {len(y_holdout):>5} amostras (isolado estritamente até o final)")
 
-    # 3. ESPECIFICAÇÃO 2: LOOP MULTI-SEED SIMÉTRICO (30 vs 30) NO DESENVOLVIMENTO
+    # PREVALÊNCIA ESTIMADA ESTRITAMENTE SOBRE O CONJUNTO DE DESENVOLVIMENTO (Zero vazamento de Holdout)
+    real_prevalence = float((y_dev != trivial_idx).mean())
+
+    print(f"\n{'=' * 86}")
+    print(" INICIALIZAÇÃO DO PIPELINE COM ISOLAMENTO OUT-OF-SAMPLE ESTRITO QUALIS A1")
+    print(f"{'=' * 86}")
+    print(f" Dataset carregado: {CSV_PATH} ({len(df_raw)} amostras totais)")
+    print(f" Prevalência de Evento Raro induzida pelo prior uniforme de amostragem prescrito (π, calculada em Dev): {real_prevalence:.4%}")
+    print(f"\n Particionamento Inicial de Isolamento Metodológico (Seed Global = {GLOBAL_HOLDOUT_SEED}):")
+    print(f"   -> Conjunto de Desenvolvimento (85%): {len(y_dev):>5} amostras (opera 5x2 CV e calibrações)")
+    print(f"   -> Conjunto Holdout Externo (15%):     {len(y_holdout):>5} amostras (isolado estritamente até o final)")
+
+    # 3. PROTOCOLO 5x2 CROSS-VALIDATION NO DESENVOLVIMENTO (10 DOBRAS CONTROLADAS)
     df_runs, models_registry = run_symmetric_multiseed_evaluation(
         X_dev=X_dev,
         y_dev=y_dev,
         trivial_idx=trivial_idx,
         n_classes=n_classes,
-        n_seeds=N_SEEDS_EVALUATION,
+        n_iterations=N_5X2CV_ITERATIONS,
         epochs=120,
         batch_size=256,
         lr=1e-3,
         patience=15,
     )
 
-    # 4. ESPECIFICAÇÃO 3: INFERÊNCIA ESTATÍSTICA PAREADA (Testes de Diferença Semente a Semente)
+    # 4. INFERÊNCIA ESTATÍSTICA PAREADA 5x2 CV (Testes de Diferença Dobra a Dobra)
     print_comparative_statistical_report(df_runs, n_seeds=N_SEEDS_EVALUATION)
     df_runs.to_csv("multiseed_paired_evaluation_dev.csv", index=False)
 
-    # 5. ESPECIFICAÇÃO 1: SELEÇÃO DO MODELO DE PRODUÇÃO POR DESEMPENHO NA VALIDAÇÃO INTERNA
+    # 5. SELEÇÃO INDEPENDENTE E SIMÉTRICA DO MODELO DE PRODUÇÃO NA VALIDAÇÃO INTERNA
     mlp_registry = models_registry["mlp"]
-    best_prod_seed = max(
+    best_mlp_fold = max(
         mlp_registry.keys(),
         key=lambda s: mlp_registry[s]["selection_key"],
     )
-    prod_mlp_candidate = mlp_registry[best_prod_seed]
+    prod_mlp_candidate = mlp_registry[best_mlp_fold]
+
+    rf_registry = models_registry["rf"]
+    best_rf_fold = max(
+        rf_registry.keys(),
+        key=lambda s: rf_registry[s]["selection_key"],
+    )
+    prod_rf_candidate = rf_registry[best_rf_fold]
+
+    lr_registry = models_registry["lr"]
+    best_lr_fold = max(
+        lr_registry.keys(),
+        key=lambda s: lr_registry[s]["selection_key"],
+    )
+    prod_lr_candidate = lr_registry[best_lr_fold]
+
     baselines_production = {
-        "rf": models_registry["rf"][best_prod_seed],
-        "lr": models_registry["lr"][best_prod_seed],
+        "rf": prod_rf_candidate,
+        "lr": prod_lr_candidate,
     }
 
     print(f"\n{'=' * 86}")
-    print(f" CONGELAMENTO DO MODELO DE PRODUÇÃO (SEMENTE {best_prod_seed} SELECIONADA NA VALIDAÇÃO INTERNA)")
-    print(f" Critério: Maximização de Recall de Validação @ Heurística k=0, desempate por menor FPR e maior F1")
-    print(f" Estratégia vencedora: {prod_mlp_candidate['strategy']} | Limiar fixado: {prod_mlp_candidate['threshold']:.4f}")
+    print(" CONGELAMENTO INDEPENDENTE DOS MODELOS DE PRODUÇÃO (Validação Interna 5x2 CV)")
+    print(f" • MLP (Dobra {best_mlp_fold}): Estratégia = {prod_mlp_candidate['strategy']}, Limiar = {prod_mlp_candidate['threshold']:.4f}")
+    print(f" • Random Forest (Dobra {best_rf_fold}): Limiar = {prod_rf_candidate['threshold']:.4f}")
+    print(f" • Regressão Logística (Dobra {best_lr_fold}): Limiar = {prod_lr_candidate['threshold']:.4f}")
     print(f"{'=' * 86}")
 
-    # 6. ESPECIFICAÇÃO 1: AVALIAÇÃO ÚNICA NO CONJUNTO HOLDOUT CEGO
+    # 6. AVALIAÇÃO ÚNICA NO CONJUNTO HOLDOUT EXTERNO
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     holdout_results = evaluate_production_on_blind_holdout(
         production_candidate=prod_mlp_candidate,
@@ -1474,7 +1444,6 @@ def main() -> None:
     )
 
     # 8. SIMULAÇÃO DO PIPELINE HÍBRIDO EM PRODUÇÃO (10^5 PONTOS)
-    # Importante: X_train_scaled fornecido é EXCLUSIVAMENTE o conjunto de treinamento da semente de produção
     hybrid_report = empirical_hybrid_pipeline(
         model=prod_mlp_candidate["model"],
         scaler=prod_mlp_candidate["scaler"],
@@ -1482,7 +1451,7 @@ def main() -> None:
         threshold=prod_mlp_candidate["threshold"],
         X_train_scaled=prod_mlp_candidate["X_train_scaled"],
         n_eval=100_000,
-        fhs_calibration_sample=40,
+        fhs_calibration_sample=1000,
         fhs_full_audit=False,
         maha_percentile=99.5,
         seed=7,
@@ -1491,19 +1460,21 @@ def main() -> None:
     # 9. SÍNTESE EXECUTIVA METODOLÓGICA QUALIS A1
     sub_mlp = df_runs[df_runs["modelo"] == "MLP"]
     print(f"\n{'=' * 86}")
-    print(" SÍNTESE EXECUTIVA QUALIS A1 — INTEGRIDADE METODOLÓGICA ASSEGURADA")
+    print(" SÍNTESE EXECUTIVA QUALIS A1 — CONFORMIDADE METODOLÓGICA ESTRITA")
     print(f"{'=' * 86}")
-    print(f" 1. Isolamento Externo: Holdout cego de 15% avaliado exatamente 1x após congelamento.")
-    print(f" 2. Pareamento Simétrico: MLP, RF e LR avaliados nas mesmas {N_SEEDS_EVALUATION} sementes e splits.")
+    print(f" 1. Isolamento Externo: Holdout externo de 15% avaliado exatamente 1x após congelamento.")
+    print(f" 2. Protocolo 5x2 CV: MLP, RF e LR avaliados nas mesmas {N_SEEDS_EVALUATION} dobras controladas.")
     print(f" 3. Estabilidade Global (Dev): Recall = {sub_mlp['recall_val'].mean():.4f} ± {sub_mlp['recall_val'].std():.4f} | "
           f"FPR = {sub_mlp['fpr_val'].mean():.4f} ± {sub_mlp['fpr_val'].std():.4f}")
-    print(f" 4. Desempenho Holdout Cego: Recall = {mlp_ho_metrics['tpr']:.4f} "
+    print(f" 4. Desempenho Holdout Externo: Recall = {mlp_ho_metrics['tpr']:.4f} "
           f"(IC 95%: [{holdout_results['mlp_ci95'][0]:.4f}, {holdout_results['mlp_ci95'][1]:.4f}]) | "
           f"FPR = {mlp_ho_metrics['fpr']:.4f}")
     print(f" 5. Precisão Projetada (Bayes, π={real_prevalence:.2%}): {proj_bayes['projected_precision']:.4%}")
     if hybrid_report is not None:
+        speedup_est = hybrid_report.get("speedup_stratified_estimated", hybrid_report.get("speedup_measured"))
         print(f" 6. Eficiência Operacional Híbrida: Redução de Chamadas FHS = {hybrid_report['oracle_reduction_pct']:.2f}% | "
-              f"Speedup = {hybrid_report['speedup_measured']:.2f}x")
+              f"Speedup Estratificado Estimado = {speedup_est:.2f}x "
+              f"(IC 95%: [{hybrid_report['speedup_ci95'][0]:.2f}x, {hybrid_report['speedup_ci95'][1]:.2f}x])")
     print(f"{'=' * 86}\n")
 
 

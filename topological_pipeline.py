@@ -132,7 +132,7 @@ def fhs_chern_number(H_batch: np.ndarray, n_occ: int) -> int | None:
         * np.roll(U1, -1, axis=1).conj()
         * U2.conj()
     )
-    F_tilde = np.angle(U_plaquette + 1e-10j)
+    F_tilde = np.angle(U_plaquette)
 
     return int(np.round(F_tilde.sum() / (2.0 * np.pi)))
 
